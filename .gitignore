@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+*.parquet
+!stock_basic.parquet
+!asi_yearly.parquet
+tdx_parsed.parquet
+*.png
+*.html
+report_gen/stock_*.csv
+report_gen/*.png
+.downloads/

@@ -1,0 +1,5 @@
+baostock==0.9.10
+pandas==3.0.3
+pyarrow==24.0.0
+numpy==2.4.4
+akshare>=1.18.0
