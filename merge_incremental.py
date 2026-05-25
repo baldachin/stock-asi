@@ -1,35 +1,42 @@
 #!/usr/bin/env python3
-"""合并 kdata_incremental.parquet 到 kdata.parquet
-   主文件 date 列是 string，增量文件 date 列是 timestamp
-   策略: 用 pyarrow 过滤主文件中增量覆盖的日期，再用 concat 合并
+"""
+合并 kdata_incremental.parquet 到 kdata.parquet
+策略:
+  1. 读取增量数据（timestamp date）
+  2. 收集需覆盖的 (date, symbol) 对
+  3. 逐 RG 读取，移除增量中已存在的记录
+  4. 追加增量，输出新文件
+  5. 备份替换
 """
 import pyarrow.parquet as pq
 import pyarrow as pa
 import pandas as pd
+import numpy as np
 import gc, os
 
 KDATA = 'kdata.parquet'
 INC   = 'kdata_incremental.parquet'
 OUT   = 'kdata_new.parquet'
 
-# 读增量
+# ---- 1. 读增量 ----
 print("读取增量...")
-inc = pq.read_table(INC)
-inc_dates = inc.column('date').to_pylist()
-# 增量日期转为 string 以便与主文件一致
-inc_dates_set = set(str(d.date()) if hasattr(d, 'date') else str(d) for d in inc_dates)
-print(f"  增量 {inc.num_rows} 行, 覆盖 {len(inc_dates_set)} 个交易日")
+inc = pq.read_table(INC).to_pandas()
+inc['date'] = pd.to_datetime(inc['date'])
+print(f"  增量 {len(inc)} 行, 日期 {inc['date'].min().date()} ~ {inc['date'].max().date()}, {inc['symbol'].nunique()} 只股票")
 
-# 增量中每个 date 对应的 symbol set
-inc_df = inc.to_pandas()
-inc_df['date'] = pd.to_datetime(inc_df['date'])
-inc_df['date_str'] = inc_df['date'].dt.strftime('%Y-%m-%d')
-inc_symbol_per_date = inc_df.groupby('date_str')['symbol'].apply(set).to_dict()
+# 增量日期集合
+inc_dates = set(inc['date'].dt.strftime('%Y-%m-%d'))
+# (date_str, symbol) -> 增量行 dict
+inc_map = {}
+for _, row in inc.iterrows():
+    key = (row['date'].strftime('%Y-%m-%d'), str(row['symbol']).zfill(6))
+    inc_map[key] = row
+print(f"  增量 key 数: {len(inc_map)}")
 
-# 扫描主文件 row groups
-print("扫描主文件 row groups...")
+# ---- 2. 扫描主文件 RG 元数据 ----
+print("扫描主文件 RG...")
 mainpf = pq.ParquetFile(KDATA)
-rg_metadata = []
+rg_info = []
 for i in range(mainpf.metadata.num_row_groups):
     rg = mainpf.metadata.row_group(i)
     date_col = None
@@ -39,105 +46,124 @@ for i in range(mainpf.metadata.num_row_groups):
             date_col = c
             break
     if date_col is None:
-        rg_metadata.append((i, rg.num_rows, None, None))
+        min_d = max_d = None
     else:
-        rg_metadata.append((i, rg.num_rows, date_col.statistics.min, date_col.statistics.max))
+        min_d = date_col.statistics.min
+        max_d = date_col.statistics.max
+        # timestamp 可能需要转 string
+        if hasattr(min_d, 'strftime'):
+            min_d = min_d.strftime('%Y-%m-%d')
+        if hasattr(max_d, 'strftime'):
+            max_d = max_d.strftime('%Y-%m-%d')
+    rg_info.append((i, min_d, max_d, rg.num_rows))
 
-# 收集需要保留的 row groups 和需要拆分的
-keep_rgs = []
-split_rgs = []  # (rg_idx, min_date, max_date, rg_rows)
-
-for rg_idx, rg_rows, min_date, max_date in rg_metadata:
-    if min_date is None:
-        keep_rgs.append(rg_idx)
+# ---- 3. 决定哪些 RG 需要处理 ----
+overlap_rgs = []
+inc_dates_sorted = sorted(inc_dates)
+min_inc = inc_dates_sorted[0]
+max_inc = inc_dates_sorted[-1]
+for rg_idx, min_d, max_d, num_rows in rg_info:
+    if min_d is None:
         continue
-    # 如果 rg 的日期范围与增量有交集
-    overlap = False
-    for d in inc_dates_set:
-        if min_date <= d <= max_date:
-            overlap = True
-            break
-    if overlap:
-        split_rgs.append((rg_idx, min_date, max_date, rg_rows))
-    else:
-        keep_rgs.append(rg_idx)
+    # 快速过滤：RG date 范围与增量完全无交集则跳过
+    if max_d < min_inc or min_d > max_inc:
+        continue
+    overlap_rgs.append(rg_idx)
 
-print(f"  保留 {len(keep_rgs)} 个 row groups")
-print(f"  需拆分 {len(split_rgs)} 个 row groups")
+print(f"  总 RG: {len(rg_info)}, 需处理: {len(overlap_rgs)}, 保留: {len(rg_info)-len(overlap_rgs)}")
 
-# 获取主文件 schema（统一使用）
-main_schema = mainpf.schema_arrow
-# 确保增量 date 也转为 string 以匹配 schema
-inc_df['date'] = inc_df['date'].dt.strftime('%Y-%m-%d')
-inc_df_dropped = inc_df.drop(columns=['date_str'])
-inc_table = pa.Table.from_pandas(inc_df_dropped, preserve_index=False)
-
-# 统一 schema：所有表的 schema 必须一致
-all_schemas_equal = (
-    main_schema.equals(inc_table.schema) or
-    all(main_schema.equals(inc_table.schema) for _ in [1])
-)
-# 实际上只保证 main_schema 用于写文件，增量 table schema 可能不同，做 cast
-inc_table = inc_table.cast(main_schema)
-
-# 分批读写
+# ---- 4. 逐 RG 处理 ----
 print("写新文件...")
 writer = None
 rows_written = 0
+total_removed = 0
 
-# 处理需拆分的 rgs
-for rg_idx, min_date, max_date, rg_rows in sorted(split_rgs):
+# 先写不重叠的 RG
+for rg_idx, min_d, max_d, num_rows in rg_info:
+    if rg_idx in overlap_rgs:
+        continue
+    table = mainpf.read_row_group(rg_idx)
+    if writer is None:
+        writer = pq.ParquetWriter(OUT, mainpf.schema_arrow, compression='snappy')
+    writer.write_table(table.cast(mainpf.schema_arrow))
+    rows_written += table.num_rows
+
+# 处理重叠的 RG：逐行合并 amount
+inc_keys_str = {f"{d}|{s}" for d, s in inc_map.keys()}
+# 转为 (key -> amount) 映射用于合并
+inc_amount_map = {f"{d}|{str(s).zfill(6)}": v['amount']
+                  for (d, s), v in inc_map.items()}
+
+for rg_idx in overlap_rgs:
     table = mainpf.read_row_group(rg_idx)
     df = table.to_pandas()
-    df['date'] = pd.to_datetime(df['date'])
-    # 过滤掉增量中存在的 (date, symbol) 对
-    symbols_to_remove = set()
-    for d in inc_dates_set:
-        if min_date <= d <= max_date:
-            if d in inc_symbol_per_date:
-                for s in inc_symbol_per_date[d]:
-                    symbols_to_remove.add((d, s))
-    mask = df.apply(lambda r: (r['date'].strftime('%Y-%m-%d'), r['symbol']) not in symbols_to_remove, axis=1)
-    df_filtered = df[mask]
-    df_filtered['date'] = df_filtered['date'].dt.strftime('%Y-%m-%d')
-    table_filtered = pa.Table.from_pandas(df_filtered, preserve_index=False).cast(main_schema)
-    del table, df, df_filtered
+    df['date_str'] = df['date'].dt.strftime('%Y-%m-%d')
+    # 向量化过滤：构建 (date_str, symbol) key 列
+    df['key'] = df['date'].dt.strftime('%Y-%m-%d') + '|' + df['symbol'].str.zfill(6)
+    mask = ~df['key'].isin(inc_keys_str)
+    df_filtered = df[mask].drop(columns=['key', 'date_str'])
+    # 增量中有交集的旧记录：提取出来后可删除 df
+    old_overlap = df[~mask][['date', 'symbol', 'amount']].copy()
+    removed = len(df) - len(df_filtered)
+    total_removed += removed
+    del table, df
     gc.collect()
-    
+
+    # 用增量的 amount 更新，但保留旧记录的非零 amount
+    old_overlap['key'] = old_overlap['date'].dt.strftime('%Y-%m-%d') + '|' + old_overlap['symbol'].str.zfill(6)
+    inc_amt = old_overlap['key'].map(inc_amount_map).fillna(0)
+    old_overlap['amount'] = np.where(inc_amt != 0, inc_amt, old_overlap['amount'])
+    old_overlap = old_overlap.drop(columns=['key'])
+    del inc_amt
+    gc.collect()
+
+    # 合并：过滤后的 + amount 保留的旧重叠记录
+    df_merged = pd.concat([df_filtered, old_overlap], ignore_index=True)
+    del df_filtered, old_overlap
+    gc.collect()
+
+    table_filtered = pa.Table.from_pandas(df_merged, preserve_index=False).cast(mainpf.schema_arrow)
+    del df_merged
+    gc.collect()
+
     if writer is None:
-        writer = pq.ParquetWriter(OUT, main_schema, compression='snappy')
+        writer = pq.ParquetWriter(OUT, mainpf.schema_arrow, compression='snappy')
     writer.write_table(table_filtered)
     rows_written += table_filtered.num_rows
     del table_filtered
     gc.collect()
-    print(f"  rg {rg_idx}: 写入完成")
+    print(f"  RG {rg_idx}: 移除 {removed} 条，写入 {rows_written} 条累计")
 
-# 写保留的 rgs
-for rg_idx in keep_rgs:
-    table = mainpf.read_row_group(rg_idx)
-    if writer is None:
-        writer = pq.ParquetWriter(OUT, main_schema, compression='snappy')
-    writer.write_table(table)
-    rows_written += table.num_rows
-    del table
-    gc.collect()
-
-# 追加增量
-print("追加增量数据...")
+# ---- 5. 追加增量 ----
+print(f"追加增量 {len(inc)} 条...")
+# 按主文件 schema 的列顺序重排
+col_order = [f.name for f in mainpf.schema_arrow]
+inc_table = pa.Table.from_pandas(inc, preserve_index=False)
+inc_table = inc_table.select(col_order).cast(mainpf.schema_arrow)
 writer.write_table(inc_table)
 rows_written += inc_table.num_rows
 writer.close()
 del writer, inc_table
 gc.collect()
 
-# 验证
-final = pq.read_table(OUT)
-print(f"\n最终: {final.num_rows:,} 行")
-first_date = final.column('date')[0].as_py()
-last_date = final.column('date')[final.num_rows-1].as_py()
-print(f"日期: {first_date} ~ {last_date}")
+# ---- 6. 验证 ----
+print("验证...")
+final_pf = pq.ParquetFile(OUT)
+print(f"  最终: {final_pf.metadata.num_rows:,} 行, {final_pf.metadata.num_row_groups} RG")
+# 取最后几行
+last = final_pf.read_row_group(final_pf.metadata.num_row_groups - 1).to_pandas()
+print(f"  最后日期: {last['date'].max()}")
+# 检查增量覆盖的日期
+check_dates = ['2026-05-21', '2026-05-22', '2026-05-25']
+for d in check_dates:
+    cnt = sum(1 for k in inc_map if k[0] == d)
+    print(f"  {d} 增量 key 数: {cnt}")
 
-# 备份旧文件，替换
-os.rename(KDATA, KDATA + '.bak2')
+# ---- 7. 备份替换 ----
+bak = KDATA + '.bak3'
+if os.path.exists(bak):
+    os.remove(bak)
+os.rename(KDATA, bak)
 os.rename(OUT, KDATA)
-print("完成！")
+print(f"\n完成！备份: {bak}")
+print(f"最终行数: {final_pf.metadata.num_rows:,}")

@@ -45,10 +45,12 @@ def get_last_date():
     from datetime import datetime
     pf = pq.ParquetFile(PARQUET_ORIG)
     num_rg = pf.metadata.num_row_groups - 1
-    # date 存储在 string 列中，取其最大值后转为 date
     table = pf.read_row_group(num_rg).to_pandas()
     last = table['date'].max()
-    return datetime.strptime(last, '%Y-%m-%d').date()
+    # date 列可能是 string 或 datetime64，统一转为 date
+    if isinstance(last, str):
+        return datetime.strptime(last, '%Y-%m-%d').date()
+    return last.date()
 
 def get_all_codes():
     """从 baostock 获取全量 A股代码"""
