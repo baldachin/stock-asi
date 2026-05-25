@@ -26,10 +26,17 @@ A股数据分析和ASI（成交额强度指标）计算系统。数据从腾讯�
 
 ## 架构要点
 
-- **Parquet row groups**：每个row group约60万行，date作为索引。直接读取row group元数据获取日期范围，避免加载数据。
+- **Parquet row groups**：每个row group约1M行，date作为普通string列。直接读取row group元数据获取日期范围，避免加载数据。
 - **并发抓取**：`update_kdata_safe.py`使用`ThreadPoolExecutor`，20个worker，每个worker最多150个请求。
 - **ASI评分**：按成交额每日排名，得分0-100。年度聚合包括得分总和、top50/top100天数统计。
 - **Notion同步**：API有速率限制（429时重试），列表查询用data_source API，创建用直接API。
+- **数据源**：K线数据来自腾讯证券，成交量额来自通达信（TDX）导出的前复权数据。腾讯证券API不返回成交额。
+
+## 已知数据问题
+
+- `kdata.parquet` 中 2026-05-12~19 的数据（来自腾讯证券，增量合并引入）成交额为 0.0。这是因为腾讯证券API本身不返回成交额字段，该部分日期的 amount 无法从腾讯证券数据补全。
+- 腾讯证券API不返回成交额（`kdata_incremental.parquet` 的 amount 字段全为 0）。TDX 是唯一的成交额数据源，但 TDX 导出的最新日期只到 2026-04-28（部分股票到 2026-05-21），2026-05-12~19 的数据 TDX 没有覆盖。
+- 修复 amount=0 需要从 TDX 重新解析成交额数据，并用 `merge` 逻辑（不用 `df.update()`）覆盖 amount=0 的记录。
 
 ## 常用命令
 

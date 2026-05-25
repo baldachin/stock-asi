@@ -42,12 +42,13 @@ def get_exchange(code):
 
 def get_last_date():
     """只读 parquet 最后一页，快速获取本地最新日期"""
+    from datetime import datetime
     pf = pq.ParquetFile(PARQUET_ORIG)
     num_rg = pf.metadata.num_row_groups - 1
-    # date 是索引列，不作为普通列读取；读取整个 row group 取索引最大值
+    # date 存储在 string 列中，取其最大值后转为 date
     table = pf.read_row_group(num_rg).to_pandas()
-    last = table.index.max()
-    return last
+    last = table['date'].max()
+    return datetime.strptime(last, '%Y-%m-%d').date()
 
 def get_all_codes():
     """从 baostock 获取全量 A股代码"""
@@ -172,7 +173,7 @@ def main():
     # Step 1: 本地最新日期
     print(f"\n[Step1] 读取本地快照...")
     last_ts = get_last_date()
-    last_date_str = str(last_ts.date())
+    last_date_str = str(last_ts)
     # 多抓 DAYS_BACK 天，防止非交易日导致漏抓
     from datetime import timedelta
     fetch_start = (last_ts - timedelta(days=DAYS_BACK)).strftime('%Y-%m-%d')
@@ -200,7 +201,7 @@ def main():
         return
 
     # Step 4: 只保留 last_date 之后的新数据
-    new_df = new_df[new_df['date'] > last_ts].reset_index(drop=True)
+    new_df = new_df[new_df['date'] > pd.Timestamp(last_ts)].reset_index(drop=True)
     print(f"  {last_date_str}之后新数据: {len(new_df)} 行, {new_df['symbol'].nunique()} 只")
     print(f"  日期范围: {new_df['date'].min().date()} ~ {new_df['date'].max().date()}")
 

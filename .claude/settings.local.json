@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('gen_charts_fix.py'\\).read\\(\\)\\); print\\('gen_charts_fix.py: 语法OK'\\)\")",
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(curl *)",
+      "Bash(fuser -k 18083/tcp)",
+      "Bash(pip show *)",
+      "Bash(pip3 list *)",
+      "Bash(fc-list :lang=zh)",
+      "Bash(pip3 install *)",
+      "Bash(fc-list)"
+    ]
+  }
+}
