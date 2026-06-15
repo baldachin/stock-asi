@@ -1,8 +1,8 @@
 import pandas as pd
 from datetime import datetime
 
-asi = pd.read_parquet('asi_yearly.parquet')
-basic = pd.read_parquet('stock_basic.parquet')
+asi = pd.read_parquet('/home/hanshuang8902/stock_data/asi_yearly.parquet')
+basic = pd.read_parquet('/home/hanshuang8902/stock_data/stock_basic.parquet')
 
 latest_year = asi['year'].max()
 basic['上市日期'] = pd.to_datetime(basic['上市日期'])

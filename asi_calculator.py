@@ -3,6 +3,7 @@ ASI (Amount Strength Index) 成交额强度指标计算
 
 核心逻辑:
 - 每日按成交额排名，计算得分: ln(max_rank + 1 - rank) / ln(max_rank + 1) × 100
+- 口径: up_only=False 全交易日 / up_only=True 仅上涨日 (close>open)
 - 年度聚合: 累加得分(asi_sum)、日均分(asi_mean)、进入前50/100天数
 
 输入: kdata.parquet (symbol, open, high, low, close, amount, volume, date)
@@ -16,7 +17,7 @@ import os
 
 # ========== 配置 ==========
 KDATA_PATH = '/home/hanshuang8902/stock/kdata.parquet'
-OUTPUT_PATH = '/home/hanshuang8902/stock/asi_yearly.parquet'
+OUTPUT_PATH = '/home/hanshuang8902/stock_data/asi_yearly.parquet'
 TOP_N_LIST = [50, 100]  # 统计进入前N名的天数
 
 # ========== 核心计算函数 ==========
@@ -25,7 +26,7 @@ def calc_daily_asi_score(amount_rank: int, max_rank: int) -> float:
     """
     计算单日ASI得分
     score = ln(max_rank + 1 - rank) / ln(max_rank + 1) × 100
-    
+
     参数:
         amount_rank: 当日成交额排名 (从1开始)
         max_rank: 当日市场股票总数 (即排名最大值)
@@ -38,14 +39,21 @@ def calc_daily_asi_score(amount_rank: int, max_rank: int) -> float:
     return round(score, 6)
 
 
-def calculate_asi():
-    """主计算流程"""
+def calculate_asi(up_only: bool = False):
+    """主计算流程
+    up_only: True=仅上涨日 (close>open) 参与排名和得分
+    """
     print(f"[{datetime.now()}] 开始读取数据: {KDATA_PATH}")
-    df = pd.read_parquet(KDATA_PATH, columns=['symbol', 'date', 'amount'])
-    
+    df = pd.read_parquet(KDATA_PATH, columns=['symbol', 'date', 'amount', 'close', 'open'])
+
     # 只保留有效成交额数据
     df = df[df['amount'] > 0].copy()
-    print(f"数据量: {len(df):,} 行")
+
+    # 上涨日过滤
+    if up_only:
+        df = df[df['close'] > df['open']].copy()
+
+    print(f"数据量: {len(df):,} 行 (口径: {'上涨日' if up_only else '全交易日'})")
     print(f"日期范围: {df['date'].min().date()} ~ {df['date'].max().date()}")
     
     # 提取年份
@@ -152,7 +160,9 @@ def calculate_asi():
 
 
 if __name__ == '__main__':
-    result = calculate_asi()
+    import sys
+    up_only = '--up' in sys.argv
+    result = calculate_asi(up_only=up_only)
     print(f"\n输出数据预览:")
     print(result.head(10))
     print(f"\n列名: {result.columns.tolist()}")
