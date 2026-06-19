@@ -18,13 +18,13 @@ import duckdb
 import time
 from datetime import datetime
 
-sys.path.insert(0, '/home/hanshuang8902/stock')
+sys.path.insert(0, 'F:/Develops/stock-asi')
 from parquet_atomic import write_atomic
 import pyarrow as pa
 
-KDATA_PATH = '/home/hanshuang8902/stock_data/kdata.parquet'
-ASI_PATH   = '/home/hanshuang8902/stock_data/asi_yearly.parquet'
-ASI_UP_PATH = '/home/hanshuang8902/stock_data/asi_yearly_up.parquet'
+KDATA_PATH = 'F:/Develops/stock_data/kdata.parquet'
+ASI_PATH   = 'F:/Develops/stock_data/asi_yearly.parquet'
+ASI_UP_PATH = 'F:/Develops/stock_data/asi_yearly_up.parquet'
 K = 3.0
 
 def calculate_asi(year: int = None, up_only: bool = False, weighted: bool = True):

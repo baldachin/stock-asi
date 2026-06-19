@@ -11,3 +11,10 @@ tdx_parsed.parquet
 report_gen/stock_*.csv
 report_gen/*.png
 .downloads/
+
+# 备份 / 日志 (本地调试产物, 不入仓)
+*.bak
+*.bak.*
+*.log
+dashboard.py.bak.*
+_download_progress.txt

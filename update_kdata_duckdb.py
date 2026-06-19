@@ -19,7 +19,7 @@ import sys
 from datetime import datetime, date, timedelta
 
 # ---------- 配置 ----------
-DB_PATH = '/home/hanshuang8902/stock_data/stock.db'
+DB_PATH = 'F:/Develops/stock_data/stock.db'
 BATCH_SIZE  = 50           # 每批股票数（单连接连续请求）
 MAX_RETRIES = 3
 DAYS_BACK   = 15           # 每次多抓几天防止遗漏

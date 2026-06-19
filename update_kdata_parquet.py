@@ -24,38 +24,68 @@ import pyarrow.parquet as pq
 import baostock as bs
 import time
 import os
-import fcntl
 import sys
 from datetime import datetime, date, timedelta
 
-sys.path.insert(0, '/home/hanshuang8902/stock')
+# 跨平台单例锁: POSIX 用 fcntl.flock, Windows 用 msvcrt.locking
+try:
+    import fcntl  # POSIX
+    _HAS_FCNTL = True
+except ImportError:
+    fcntl = None
+    _HAS_FCNTL = False
+    try:
+        import msvcrt  # Windows
+        _HAS_MSVCRT = True
+    except ImportError:
+        msvcrt = None
+        _HAS_MSVCRT = False
+
+sys.path.insert(0, 'F:/Develops/stock-asi')
 from parquet_atomic import write_atomic
 
 # ---------- 配置 ----------
-PARQUET_PATH = '/home/hanshuang8902/stock_data/kdata.parquet'
+PARQUET_PATH = 'F:/Develops/stock_data/kdata.parquet'
 BATCH_SIZE  = 50           # 每批股票数
 MAX_RETRIES = 3
 DAYS_BACK   = 15           # 每次多抓几天防止遗漏
 CROP_DAYS   = 30           # 合并时裁掉最后 30 天, 避免与已有 recent 数据重复
 # ----------------------------
 
-LOCK_FILE = '/tmp/update_kdata_parquet.lock'
+LOCK_FILE = 'F:/Develops/stock_data/update_kdata_parquet.lock'
 
 def acquire_lock():
-    """单例锁: 防止多个 update 进程同时跑"""
+    """单例锁: 防止多个 update 进程同时跑 (POSIX fcntl / Windows msvcrt)"""
+    lock_fd = open(LOCK_FILE, 'w')
     try:
-        lock_fd = open(LOCK_FILE, 'w')
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        lock_fd.write(str(os.getpid()))
-        lock_fd.flush()
-        return lock_fd
-    except BlockingIOError:
+        if _HAS_FCNTL:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif _HAS_MSVCRT:
+            # msvcrt.locking 需要先 seek 到 0,锁定文件至少 1 字节
+            lock_fd.seek(0)
+            try:
+                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                lock_fd.close()
+                return None
+        else:
+            # 无锁可用, 退化为单 PID 检测 (不严格,但单用户场景够用)
+            lock_fd.write(str(os.getpid()))
+            lock_fd.flush()
+            return lock_fd
+    except (BlockingIOError, OSError):
+        lock_fd.close()
         return None
+    lock_fd.write(str(os.getpid()))
+    lock_fd.flush()
+    return lock_fd
 
 def get_last_date_from_parquet():
     """从 kdata.parquet 读 max_date, 用 row group 过滤避免加载全量"""
     if not os.path.exists(PARQUET_PATH):
-        return date(1990, 1, 1)
+        # 首次运行: 默认从 2017-01-01 开始 (10 年历史, 约 1200 万行)
+        # 如果想要全量 (1990-至今),改成 date(1990, 1, 1)
+        return date(2017, 1, 1)
 
     pf = pq.ParquetFile(PARQUET_PATH)
     # 1. 读最后一行的 date 列 (每个 row group 1M 行, 我们读 1 个 row group)

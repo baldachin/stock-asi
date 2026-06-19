@@ -5,7 +5,7 @@ A股数据可视化面板 (Streamlit)
 - 同业对比
 - 行业强弱热力图
 
-启动: streamlit run /home/hanshuang8902/stock/dashboard.py
+启动: /home/braveyun/stock-asi-new/venv/bin/streamlit run /home/braveyun/stock-asi-new/stock-asi/dashboard.py --server.port 8502
 默认: http://localhost:8501
 """
 import streamlit as st
@@ -14,15 +14,18 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, date, timedelta
+from pathlib import Path
 import os
+import time
+import threading
 
 # ---------- 配置 ----------
 # 数据源: Parquet 文件 (无锁, 持久, 原子替换)
 # 2026-06-05 迁移: 从 DuckDB stock.db 改为 4 个独立 Parquet 文件
-KDATA_PATH    = '/home/hanshuang8902/stock_data/kdata.parquet'
-ASI_PATH      = '/home/hanshuang8902/stock_data/asi_yearly.parquet'
-ASI_UP_PATH   = '/home/hanshuang8902/stock_data/asi_yearly_up.parquet'
-BASIC_PATH    = '/home/hanshuang8902/stock_data/stock_basic.parquet'
+KDATA_PATH    = os.environ.get('STOCK_KDATA',   '/home/braveyun/stock_data/kdata.parquet')
+ASI_PATH      = os.environ.get('STOCK_ASI',     '/home/braveyun/stock_data/asi_yearly.parquet')
+ASI_UP_PATH   = os.environ.get('STOCK_ASI_UP',  '/home/braveyun/stock_data/asi_yearly_up.parquet')
+BASIC_PATH    = os.environ.get('STOCK_BASIC',   '/home/braveyun/stock_data/stock_basic.parquet')
 
 # 中文字体 (Camoufox 缓存的 NotoSansSC) — plotly 自带字体回退机制
 # 不需要 matplotlib（dashboard 全程用 plotly 画图）
@@ -41,27 +44,119 @@ st.set_page_config(
 # - 性能与原 DuckDB 一样, 因为底层还是 DuckDB
 # - writer 改 Parquet 时, dashboard 仍能读旧 fd 看到旧数据, 不报错
 
+@st.cache_resource
 def get_con():
-    """打开 in-memory DuckDB, 注册 4 个 Parquet 文件为 VIEW
+    """打开 in-memory DuckDB, 注册 4 个 Parquet 文件
 
-    健壮性: 某个 Parquet 不存在时不崩, 跳过该 VIEW
-    这样 dashboard 能在 kdata 未迁移前也启动 (asi/ranking 页面会报"表不存在")
+    2026-06-19 v2 优化 (响应速度):
+    - @st.cache_resource: 跨页面/跨用户共享同一个 DuckDB 连接, 避免每次重连
+      重建 5.8s 物化表。Streamlit 1.x + duckdb 1.5+ 线程安全。
+    - kdata VIEW → TABLE 物化 (16M 行 一次性 O(N) 扫描, 之后查询 50-100x 加速)
+    - SET threads=8 (并行扫描)
+    - SET enable_object_cache=true (parquet metadata 跨查询缓存)
+    - stock_basic 物化出 slim 表 (代码/名称/行业/地区/上市日期) — 各排名页 JOIN 必备
+
+    线程安全说明:
+    - DuckDB 1.5+ 默认每个 connection 独立 state, 单线程内安全
+    - Streamlit 偶发同 session 多线程 (eg 按钮 click 与 auto-refresh 重叠)
+      会触发 "Different thread" 错误, 所以加 RLock 保护
     """
     con = duckdb.connect(':memory:')
-    for view, path in [
-        ('kdata',         KDATA_PATH),
-        ('asi_yearly',    ASI_PATH),
-        ('asi_yearly_up', ASI_UP_PATH),
-        ('stock_basic',   BASIC_PATH),
-    ]:
+    # 性能调优 (来自老 app.py 验证)
+    con.execute("SET threads TO 8")
+    con.execute("SET enable_object_cache TO true")
+
+    # kdata: VIEW 改 TABLE (kdata 16M+ 行, 物化后查询从 2-5s 降到 50-100ms)
+    if os.path.exists(KDATA_PATH):
+        con.execute(f"""
+            CREATE OR REPLACE TABLE kdata AS
+            SELECT symbol, date, open, high, low, close, volume, amount
+            FROM read_parquet('{KDATA_PATH}')
+        """)
+
+    # asi_yearly 两个口径 — 体积小, VIEW 即可
+    for view, path in [('asi_yearly', ASI_PATH), ('asi_yearly_up', ASI_UP_PATH)]:
         if os.path.exists(path):
-            con.execute(f"CREATE VIEW {view} AS SELECT * FROM read_parquet('{path}')")
+            con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet('{path}')")
+
+    # stock_basic: 全字段 50+ 列, 物化 slim 版本 (代码/名称/行业/地区/上市日期) 给排名页用
+    if os.path.exists(BASIC_PATH):
+        con.execute(f"""
+            CREATE OR REPLACE VIEW stock_basic AS
+            SELECT * FROM read_parquet('{BASIC_PATH}')
+        """)
+        con.execute(f"""
+            CREATE OR REPLACE TABLE stock_slim AS
+            SELECT 代码 AS symbol,
+                   名称 AS name,
+                   细分行业 AS industry,
+                   地区 AS region,
+                   上市日期 AS listing_date
+            FROM read_parquet('{BASIC_PATH}')
+        """)
+    # 加 RLock 保护跨线程访问 (Streamlit 单 session 偶发多线程)
+    # duckdb 1.5 C 扩展对象不能加属性, 用 module-level dict 存 lock
+    con_id = id(con)
+    _CON_LOCKS[con_id] = threading.RLock()
     return con
+
+def get_lock(con):
+    """获取 connection 对应的 lock (目前 load_* 函数未使用, 留作未来扩展)"""
+    return _CON_LOCKS.get(id(con))
+
+_CON_LOCKS = {}  # id(con) -> RLock
 
 def safe_query(sql, params=None, label=""):
     """执行 SQL (无需 lock 处理, Parquet 文件始终可读)"""
     con = get_con()
+    lock = get_lock(con)
+    if lock:
+        with lock:
+            return con.execute(sql, params or []).df()
     return con.execute(sql, params or []).df()
+
+# ── 缓存下拉数据 (高频小查询) ──
+@st.cache_data(ttl=3600)
+def get_symbols() -> list:
+    """返回 [{symbol, name, industry, region}, ...] 用于下拉, 1h 缓存"""
+    con = get_con()
+    df = con.execute("""
+        SELECT s.symbol, s.name, s.industry, s.region
+        FROM stock_slim s
+        WHERE s.symbol IN (SELECT DISTINCT symbol FROM kdata)
+        ORDER BY s.symbol
+    """).df()
+    return df.to_dict("records")
+
+@st.cache_data(ttl=3600)
+def get_industries() -> list:
+    con = get_con()
+    return [r[0] for r in con.execute(
+        "SELECT DISTINCT industry FROM stock_slim WHERE industry IS NOT NULL AND industry != '' ORDER BY industry"
+    ).fetchall()]
+
+@st.cache_data(ttl=3600)
+def get_regions() -> list:
+    con = get_con()
+    return [r[0] for r in con.execute(
+        "SELECT DISTINCT region FROM stock_slim WHERE region IS NOT NULL AND region != '' ORDER BY region"
+    ).fetchall()]
+
+@st.cache_data(ttl=3600)
+def get_date_range() -> tuple:
+    con = get_con()
+    mn, mx = con.execute("SELECT MIN(date), MAX(date) FROM kdata").fetchone()
+    return mn.date() if hasattr(mn, 'date') else mn, mx.date() if hasattr(mx, 'date') else mx
+
+@st.cache_data(ttl=3600)
+def get_kpi() -> dict:
+    """侧栏用总览数据 — 一次性取齐"""
+    con = get_con()
+    total_stocks = con.execute("SELECT COUNT(DISTINCT symbol) FROM kdata").fetchone()[0]
+    date_range = con.execute("SELECT MIN(date), MAX(date) FROM kdata").fetchone()
+    date_range = (date_range[0].date(), date_range[1].date())
+    total_rows = con.execute("SELECT COUNT(*) FROM kdata").fetchone()[0]
+    return dict(total_stocks=total_stocks, date_range=date_range, total_rows=total_rows)
 
 @st.cache_data(ttl=600)
 def load_stock_basic():
@@ -442,7 +537,8 @@ with st.sidebar:
     st.caption(f"今日: {date.today()}")
 
     # 页面切换: st.radio 直接返回用户选择, 不绕 session_state
-    PAGES = ["🏠 总览", "📊 个股K线", "🏆 ASI 排名", "📈 RPS 排名", "🎯 低吸观察池", "🏭 行业强度", "⚖️ 同业对比"]
+    PAGES = ["🏠 总览", "📊 个股K线", "🏆 ASI 排名", "📈 RPS 排名", "🎯 低吸观察池", "🏭 行业强度", "⚖️ 同业对比",
+             "🔍 筛选检索", "🏆 排行榜", "🏭 行业概览", "💻 SQL 控制台"]
 
     # 跳转按钮: 通过 st.query_params['page'] 改 page, 这里读出后用
     # (跳转按钮在 ASI 排名/RPS 排名页里, 调 st.query_params.update + st.rerun)
@@ -465,21 +561,43 @@ with st.sidebar:
     st.session_state._current_page = page
 
     st.divider()
+    # mtime 自动清缓存 (数据更新后下次访问自动重查)
+    DATA_SOURCES = [
+        Path(KDATA_PATH), Path(ASI_PATH), Path(ASI_UP_PATH), Path(BASIC_PATH),
+    ]
+    def _latest_mtime() -> float:
+        ms = []
+        for p in DATA_SOURCES:
+            if p.exists():
+                ms.append(p.stat().st_mtime)
+        return max(ms) if ms else 0.0
+    def _fmt_mtime(ts: float) -> str:
+        return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts > 0 else "—"
+    current_mtime = _latest_mtime()
+    if "_data_mtime_seen" not in st.session_state:
+        st.session_state._data_mtime_seen = current_mtime
+    if current_mtime > st.session_state._data_mtime_seen:
+        st.cache_data.clear()
+        st.session_state._data_mtime_seen = current_mtime
+        st.toast(f"🔄 数据已更新 ({_fmt_mtime(current_mtime)})", icon="📈")
+    st.caption(f"🕒 数据快照: {_fmt_mtime(current_mtime)}")
     if st.button("🔄 刷新缓存"):
         st.cache_data.clear()
         st.rerun()
 
 # ---------- 主页 ----------
-# 不用顶层 con, 每个查询新开 (in-memory DuckDB 启动 ~50ms, 可接受)
-basic = load_stock_basic()
-basic['代码'] = basic['代码'].astype(str).str.zfill(6)
+# KPI 一次性取齐 (1h 缓存)
+kpi = get_kpi()
+total_stocks = kpi['total_stocks']
+date_range = kpi['date_range']
+total_rows = kpi['total_rows']
 
-# 数据概览 (用一次性 in-memory 连接)
-_overview_con = get_con()
-total_stocks = _overview_con.execute("SELECT COUNT(DISTINCT symbol) FROM kdata").fetchone()[0]
-date_range = _overview_con.execute("SELECT MIN(date), MAX(date) FROM kdata").fetchone()
-total_rows = _overview_con.execute("SELECT COUNT(*) FROM kdata").fetchone()[0]
-_overview_con.close()
+# 股票基础信息 (代码/名称/行业/地区) — 多个页面要用
+@st.cache_data(ttl=3600)
+def _basic():
+    return load_stock_basic()
+basic = _basic()
+basic['代码'] = basic['代码'].astype(str).str.zfill(6)
 
 st.sidebar.info(
     f"📦 {total_stocks:,} 只股\n\n"
@@ -528,7 +646,7 @@ if page == "🏠 总览":
     fig.update_layout(title="市场活跃度", hovermode='x unified', height=400)
     fig.update_yaxes(title_text="成交额(亿)", secondary_y=False)
     fig.update_yaxes(title_text="股数", secondary_y=True)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     st.divider()
 
@@ -543,7 +661,7 @@ if page == "🏠 总览":
             marker_color='teal', text=df_ind['股票数'], textposition='outside'
         ))
         fig.update_layout(height=500, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with c2:
         st.subheader("🌍 地区分布 Top 15")
@@ -554,7 +672,7 @@ if page == "🏠 总览":
             hole=0.4, textinfo='label+percent'
         ))
         fig.update_layout(height=500)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 # ============================================================
 # 页面 2: 个股K线
@@ -609,18 +727,21 @@ elif page == "📊 个股K线":
         st.caption(f"行业: {info['细分行业']} | 地区: {info['地区']} | 上市: {info['上市日期']}")
 
     # ASI 口径
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
         start = st.date_input("起始日", date(2025, 1, 1), min_value=date(1990, 1, 1))
     with c2:
         con_local = get_con()
         db_max = con_local.execute("SELECT MAX(date) FROM kdata").fetchone()[0]
+        db_max = db_max.date() if hasattr(db_max, 'date') else db_max  # datetime → date
         end = st.date_input("结束日", db_max, min_value=date(1990, 1, 1), max_value=db_max)
     with c3:
-        show_vol = st.checkbox("显示成交量", True)
+        period = st.selectbox("周期", ["日", "周", "月"], index=0, key='kline_period')
     with c4:
-        show_amount = st.checkbox("显示成交额", True)
+        show_vol = st.checkbox("显示成交量", True)
     with c5:
+        show_amount = st.checkbox("显示成交额", True)
+    with c6:
         asi_mode = st.radio("ASI口径", ["v2 加权", "v1 仅上涨日"], index=0, key='kline_asi_mode',
                             horizontal=True, help="v2 加权推荐, v1 旧版仅上涨日")
         asi_mode_key = "v2" if "v2" in asi_mode else "up"
@@ -629,6 +750,22 @@ elif page == "📊 个股K线":
     if df.empty:
         st.warning("该日期范围无数据")
         st.stop()
+
+    # 周/月 K 线 resample (2026-06-19 整合自老 app.py)
+    if period != "日":
+        df = df.copy()
+        df['date'] = pd.to_datetime(df['date'])
+        rule = "W" if period == "周" else "ME"
+        df = df.set_index("date").resample(rule).agg({
+            "open": "first", "high": "max", "low": "min", "close": "last",
+            "volume": "sum", "amount": "sum",
+            "amount_rank": "mean", "max_rank": "mean", "asi_score": "sum",
+            "in_top50": "sum", "in_top100": "sum",
+            "rps5": "last", "rps10": "last", "rps20": "last", "rps60": "last", "rps120": "last",
+        }).dropna(subset=["open"]).reset_index()
+        # 排名类列重置 (mean 后不再有 0/1 意义, 转成 0/1 表示"周期内 ≥1 天上榜")
+        df['in_top50'] = (df['in_top50'] > 0).astype(int)
+        df['in_top100'] = (df['in_top100'] > 0).astype(int)
 
     # K线图 (5 行: K线 / 成交量 / 成交额 / ASI / RPS)
     panels = [('k', 0.40)]
@@ -708,7 +845,7 @@ elif page == "📊 个股K线":
     if show_amount: fig.update_yaxes(title_text="额(亿)", row=show_vol+2, col=1)
     fig.update_yaxes(title_text="ASI(0-100)", row=cur_row-1, col=1)
     fig.update_yaxes(title_text="RPS(0-100)", row=cur_row, col=1)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # 区间 ASI 摘要
     st.subheader("🏆 ASI 区间摘要")
@@ -773,7 +910,7 @@ elif page == "📊 个股K线":
         for c in display.columns:
             if display[c].dtype == 'float64':
                 display[c] = display[c].round(2)
-        st.dataframe(display, use_container_width=True, height=400)
+        st.dataframe(display, width='stretch', height=400)
 
     # 统计指标
     st.subheader("📊 区间统计")
@@ -797,7 +934,7 @@ elif page == "📊 个股K线":
         name='日收益率'
     ))
     fig.update_layout(xaxis_title="日收益率(%)", yaxis_title="频次", height=350)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 # ============================================================
 # 页面 3: ASI 排名
@@ -853,7 +990,7 @@ elif page == "🏆 ASI 排名":
         'asi_score_ratio': 'ASI分数比',
     }
     display = display.rename(columns=rename_map)
-    st.dataframe(display, use_container_width=True, height=500)
+    st.dataframe(display, width='stretch', height=500)
 
     # 个股跳转
     st.subheader("🔍 跳转到个股详情")
@@ -868,12 +1005,12 @@ elif page == "🏆 ASI 排名":
         )
     with c2:
         st.write("")  # 间距
-        if st.button("📊 查看个股详情", use_container_width=True):
+        if st.button("📊 查看个股详情", width='stretch'):
             st.query_params.update(page="📊 个股K线", symbol=sel)
             st.rerun()
     with c3:
         st.write("")
-        if st.button("🏭 查看个股所属行业强度", use_container_width=True):
+        if st.button("🏭 查看个股所属行业强度", width='stretch'):
             st.query_params.update(page="🏭 行业强度")
             st.rerun()
 
@@ -888,7 +1025,7 @@ elif page == "🏆 ASI 排名":
             text=df.head(20)['asi_sum'].round(1), textposition='outside'
         ))
         fig.update_layout(height=600, yaxis={'categoryorder': 'total ascending'})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with c2:
         st.subheader("行业分布")
@@ -899,7 +1036,7 @@ elif page == "🏆 ASI 排名":
             hole=0.4, textinfo='label+percent'
         ))
         fig.update_layout(height=600)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 # ============================================================
 # 页面 4: RPS 排名
@@ -911,6 +1048,7 @@ elif page == "📈 RPS 排名":
 
     con = get_con()
     db_max = con.execute("SELECT MAX(date) FROM kdata").fetchone()[0]
+    db_max = db_max.date() if hasattr(db_max, 'date') else db_max  # datetime → date
 
     c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
     with c1:
@@ -956,7 +1094,7 @@ elif page == "📈 RPS 排名":
     display = display.sort_values(f'RPS_{periods[0]}日', ascending=False).reset_index(drop=True)
     display.index = display.index + 1
     st.caption(f"截止: {end_date} | 上市满 {listed_years} 年 | 周期: {periods}")
-    st.dataframe(display, use_container_width=True, height=500)
+    st.dataframe(display, width='stretch', height=500)
 
     # 跳转入口
     st.subheader("🔍 跳转到个股详情")
@@ -967,7 +1105,7 @@ elif page == "📈 RPS 排名":
                                 key='rps_jump')
     with c2:
         st.write("")
-        if st.button("📊 查看该股 K线 + ASI + RPS", key='rps_jump_btn', use_container_width=True):
+        if st.button("📊 查看该股 K线 + ASI + RPS", key='rps_jump_btn', width='stretch'):
             st.query_params.update(page="📊 个股K线", symbol=rps_jump)
             st.rerun()
 
@@ -1009,7 +1147,7 @@ elif page == "📈 RPS 排名":
             height=600, xaxis=dict(range=[0, 100]), yaxis=dict(range=[0, 100]),
             showlegend=False
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     # RPS Top 20 横向柱图
     st.subheader(f"RPS_{periods[0]}日 Top 20")
@@ -1024,7 +1162,7 @@ elif page == "📈 RPS 排名":
     ))
     fig.update_layout(height=500, xaxis=dict(range=[80, 100]),
                       yaxis=dict(autorange='reversed'))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # 提示
     st.info("💡 **多周期交叉验证**："
@@ -1042,6 +1180,9 @@ elif page == "🏭 行业强度":
     con_local = get_con()
     db_max_date = con_local.execute("SELECT MAX(date) FROM kdata").fetchone()[0]
     db_min_date = con_local.execute("SELECT MIN(date) FROM kdata").fetchone()[0]
+    # DuckDB 返回 datetime,streamlit.date_input 是 date — 转 date 才能比较
+    db_max_date = db_max_date.date() if hasattr(db_max_date, 'date') else db_max_date
+    db_min_date = db_min_date.date() if hasattr(db_min_date, 'date') else db_min_date
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
@@ -1108,7 +1249,7 @@ elif page == "🏭 行业强度":
             yaxis={'categoryorder': 'total ascending'}
         )
         fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     with c2:
         st.subheader("明细")
@@ -1124,7 +1265,7 @@ elif page == "🏭 行业强度":
         display['加权强度' if weighted else '总成交额(亿)'] = (
             display['加权强度' if weighted else '总成交额(亿)'].round(2)
         )
-        st.dataframe(display, use_container_width=True, height=600)
+        st.dataframe(display, width='stretch', height=600)
 
     # 跳转: 查看该行业的个股
     st.subheader("🔍 跳转到同业对比")
@@ -1140,7 +1281,7 @@ elif page == "🏭 行业强度":
                                 key='ind_jump')
     with c2:
         st.write("")
-        if st.button("⚖️ 查看该行业个股", key='ind_jump_btn', use_container_width=True):
+        if st.button("⚖️ 查看该行业个股", key='ind_jump_btn', width='stretch'):
             # 通过 session_state 传行业, 同业对比页读这个
             st.session_state['peer_industry_preset'] = ind_jump
             st.session_state._current_page = "⚖️ 同业对比"
@@ -1149,7 +1290,7 @@ elif page == "🏭 行业强度":
         st.write("")
         # 选该行业第一只股, 直接跳到个股
         first_sym = basic[basic['细分行业'] == ind_jump]['代码'].iloc[0] if len(basic[basic['细分行业'] == ind_jump]) else None
-        if first_sym and st.button("📊 看代表股 K线", key='ind_jump_rep', use_container_width=True):
+        if first_sym and st.button("📊 看代表股 K线", key='ind_jump_rep', width='stretch'):
             st.session_state._current_page = "📊 个股K线"
             st.session_state.symbol = first_sym
             st.session_state.return_to = "🏭 行业强度"
@@ -1167,8 +1308,8 @@ elif page == "🎯 低吸观察池":
         """v2 低吸观察池: 5 个切片, 每次切都用同一基础数据 (asi + kdata + basic)
         返回 dict: slice_name -> DataFrame
         """
-        KDATA = '/home/hanshuang8902/stock_data/kdata.parquet'
-        ASI   = '/home/hanshuang8902/stock_data/asi_yearly.parquet'
+        KDATA = os.environ.get('STOCK_KDATA', '/home/braveyun/stock_data/kdata.parquet')
+        ASI   = os.environ.get('STOCK_ASI', '/home/braveyun/stock_data/asi_yearly.parquet')
 
         con = duckdb.connect(':memory:')
         con.execute(f"CREATE VIEW kdata AS SELECT * FROM read_parquet('{KDATA}')")
@@ -1314,7 +1455,7 @@ elif page == "🎯 低吸观察池":
         # 用 st.dataframe 渲染 (可点击查看; 跳转用 session_state)
         st.dataframe(
             view,
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 'symbol': st.column_config.TextColumn('代码', width='small'),
@@ -1404,7 +1545,7 @@ elif page == "⚖️ 同业对比":
         hovermode='x unified', height=600
     )
     fig.add_hline(y=1.0, line_dash="dash", line_color="gray", opacity=0.5)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # 收益对比表
     st.subheader("📊 收益对比")
@@ -1419,7 +1560,7 @@ elif page == "⚖️ 同业对比":
             rows.append({'代码': sym, '名称': name, '区间收益(%)': round(ret, 2),
                          '最大净值': round(sub['nav'].max(), 3),
                          '最小净值': round(sub['nav'].min(), 3)})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), width='stretch')
 
     # 跳转入口
     st.subheader("🔍 跳转到个股详情")
@@ -1430,7 +1571,7 @@ elif page == "⚖️ 同业对比":
                                 key='peer_jump')
     with c2:
         st.write("")
-        if st.button("📊 K线 + ASI", key='peer_jump_btn', use_container_width=True):
+        if st.button("📊 K线 + ASI", key='peer_jump_btn', width='stretch'):
             st.session_state._current_page = "📊 个股K线"
             st.session_state.symbol = jump_sym
             st.session_state.return_to = "⚖️ 同业对比"
@@ -1438,8 +1579,295 @@ elif page == "⚖️ 同业对比":
             st.rerun()
     with c3:
         st.write("")
-        if st.button("↩️ 跳到行业强度", key='peer_back_ind', use_container_width=True):
+        if st.button("↩️ 跳到行业强度", key='peer_back_ind', width='stretch'):
             st.session_state._current_page = "🏭 行业强度"
             st.rerun()
 
-st.caption("--- 数据源: ~/stock_data/stock.db | Powered by Streamlit + DuckDB + Plotly")
+# ============================================================
+# 页面 8: 筛选检索 (2026-06-19 整合自老 app.py)
+# 注意: stock_basic 是静态基本面 (53 列), 没有 PE/换手率/涨跌幅 等动态字段
+# 涨跌幅 用 kdata 自己算, 静态指标用 stock_basic
+# ============================================================
+elif page == "🔍 筛选检索":
+    st.header("🔍 筛选检索 (基本面 + 行情交叉)")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        d_start = st.date_input("起始日", date.today() - timedelta(days=30),
+                                min_value=date_range[0], max_value=date_range[1], key='flt_start')
+    with c2:
+        d_end = st.date_input("结束日", date_range[1],
+                              min_value=date_range[0], max_value=date_range[1], key='flt_end')
+
+    c3, c4, c5, c6 = st.columns(4)
+    with c3:
+        sel_industries = st.multiselect("行业", get_industries(), key='flt_ind')
+    with c4:
+        sel_regions = st.multiselect("地区", get_regions(), key='flt_reg')
+    with c5:
+        min_close = st.number_input("最小收盘价", 0.0, 10000.0, 0.0, key='flt_minclose')
+    with c6:
+        sort_by = st.selectbox("排序", ["成交额(亿)", "总市值(亿)", "涨幅%", "净利润率%", "PB倒数"],
+                               key='flt_sort', help="PB倒数=市净率倒序, 越大越便宜; 净利润率=净利润/营收")
+
+    con = get_con()
+    conds, params = [], [d_start, d_end]
+    if sel_industries:
+        ph = ",".join(["?"] * len(sel_industries))
+        conds.append(f"b.细分行业 IN ({ph})")
+        params.extend(sel_industries)
+    if sel_regions:
+        ph = ",".join(["?"] * len(sel_regions))
+        conds.append(f"b.地区 IN ({ph})")
+        params.extend(sel_regions)
+    if min_close > 0:
+        conds.append("t.close >= ?")
+        params.append(min_close)
+    extra = " AND ".join(conds)
+    if extra:
+        extra = "AND " + extra
+
+    sort_map = {
+        "成交额(亿)":     "rb.amount_avg DESC",
+        "总市值(亿)":     "(b.总股本_亿 * t.close) DESC",
+        "涨幅%":          "(t.close - p.prev_close) / NULLIF(p.prev_close, 0) * 100 DESC",
+        "净利润率%":      "b.净利润率 DESC",
+        "PB倒数":         "1.0 / NULLIF(b.市净率, 0) DESC",
+    }
+
+    sql = f"""
+        WITH range_bars AS (
+            SELECT symbol, AVG(amount) AS amount_avg
+            FROM kdata WHERE date BETWEEN ? AND ? GROUP BY symbol
+        ),
+        today_bars AS (
+            SELECT * FROM kdata WHERE date = (SELECT MAX(date) FROM kdata)
+        ),
+        prev_day AS (
+            SELECT k.symbol, k.close AS prev_close
+            FROM kdata k
+            WHERE k.date = (SELECT MAX(date) FROM kdata WHERE date < (SELECT MAX(date) FROM kdata))
+        )
+        SELECT
+            b.代码       AS 代码,
+            b.名称       AS 名称,
+            b.细分行业   AS 行业,
+            b.地区       AS 地区,
+            ROUND(t.close, 2)        AS 收盘,
+            ROUND((t.close - p.prev_close) / NULLIF(p.prev_close, 0) * 100, 2) AS 涨幅_pct,
+            ROUND(b.净利润率, 2)       AS ROE_pct,
+            ROUND(b.市净率, 2)       AS PB,
+            ROUND(b.毛利率, 1)       AS 毛利率_pct,
+            ROUND(b.收入同比, 1)     AS 营收同比_pct,
+            ROUND(b.利润同比, 1)     AS 净利同比_pct,
+            ROUND(b.总股本_亿, 2)    AS 总股本_亿,
+            ROUND(b.总股本_亿 * t.close, 0) AS 总市值_亿,
+            ROUND(rb.amount_avg/1e8, 2) AS 日均成交额_亿
+        FROM stock_basic b
+        JOIN today_bars t ON b.代码 = t.symbol
+        JOIN range_bars rb ON b.代码 = rb.symbol
+        JOIN prev_day p ON b.代码 = p.symbol
+        WHERE 1=1 {extra}
+        ORDER BY {sort_map[sort_by]}
+        LIMIT 200
+    """
+    try:
+        df = con.execute(sql, params).df()
+    except Exception as e:
+        st.error(f"查询失败: {e}")
+        st.stop()
+    st.caption(f"匹配 {len(df)} 只")
+    st.dataframe(df, width='stretch', height=600)
+    if not df.empty:
+        st.download_button("下载 CSV", df.to_csv(index=False).encode("utf-8-sig"),
+                           "filter_result.csv", "text/csv", key='flt_dl')
+
+
+# ============================================================
+# 页面 9: 排行榜 (2026-06-19 整合自老 app.py)
+# 当日截面, 涨幅/成交额/ROE/PB倒数
+# ============================================================
+elif page == "🏆 排行榜":
+    st.header("🏆 排行榜 (当日截面)")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        metric = st.radio("指标", ["涨幅%", "成交额(亿)", "净利润率%", "PB倒数(低→高)"],
+                          horizontal=True, key='rank_metric')
+    with c2:
+        sel_industries_r = st.multiselect("行业 (留空=全部)", get_industries(), key='rank_ind')
+
+    con = get_con()
+    where = "1=1"
+    params = []
+    if sel_industries_r:
+        ph = ",".join(["?"] * len(sel_industries_r))
+        where += f" AND b.细分行业 IN ({ph})"
+        params.extend(sel_industries_r)
+
+    if metric == "涨幅%":
+        order_col = "(t.close - p.prev_close) / NULLIF(p.prev_close, 0) * 100"
+    elif metric == "成交额(亿)":
+        order_col = "t.amount / 1e8"
+    elif metric == "净利润率%":
+        order_col = "b.净利润率"
+    else:  # PB倒数 (低 PB → 高 1/PB)
+        order_col = "1.0 / NULLIF(b.市净率, 0)"
+
+    sql = f"""
+        WITH today_bars AS (
+            SELECT * FROM kdata WHERE date = (SELECT MAX(date) FROM kdata)
+        ),
+        prev_day AS (
+            SELECT k.symbol, k.close AS prev_close
+            FROM kdata k
+            WHERE k.date = (SELECT MAX(date) FROM kdata WHERE date < (SELECT MAX(date) FROM kdata))
+        )
+        SELECT
+            b.代码, b.名称, b.细分行业 AS 行业, b.地区,
+            ROUND(t.close, 2)  AS 收盘,
+            ROUND((t.close - p.prev_close) / NULLIF(p.prev_close, 0) * 100, 2) AS 涨幅_pct,
+            ROUND(t.amount/1e8, 2) AS 成交额_亿,
+            ROUND(b.净利润率, 2) AS ROE_pct,
+            ROUND(b.市净率, 2) AS PB,
+            ROUND(b.毛利率, 1) AS 毛利率_pct,
+            ROUND(b.收入同比, 1) AS 营收同比_pct,
+            ROUND(b.利润同比, 1) AS 净利同比_pct
+        FROM stock_basic b
+        JOIN today_bars t ON b.代码 = t.symbol
+        JOIN prev_day p ON b.代码 = p.symbol
+        WHERE {where} AND {order_col} IS NOT NULL
+        ORDER BY {order_col} DESC
+        LIMIT 30
+    """
+    df_top = con.execute(sql, params).df()
+    sql_asc = sql.replace("DESC", "ASC", 1)
+    df_bot = con.execute(sql_asc, params).df()
+
+    t1, t2 = st.tabs(["📈 TOP 30", "📉 BOTTOM 30"])
+    with t1:
+        st.dataframe(df_top, width='stretch', height=600)
+        if not df_top.empty:
+            st.download_button("下载 TOP CSV", df_top.to_csv(index=False).encode("utf-8-sig"),
+                               "rank_top.csv", "text/csv", key='rank_dl_top')
+    with t2:
+        st.dataframe(df_bot, width='stretch', height=600)
+
+
+# ============================================================
+# 页面 10: 行业概览 (2026-06-19 整合自老 app.py)
+# 行业/地区 维度 × 财务质量 × 涨幅 × 散点图
+# ============================================================
+elif page == "🏭 行业概览":
+    st.header("🏭 行业概览 (财务质量 + 涨幅 + 资金)")
+
+    con = get_con()
+    dim = st.radio("分组维度", ["行业", "地区"], horizontal=True, key='ind_overview_dim')
+    col = "b.细分行业" if dim == "行业" else "b.地区"
+
+    sql = f"""
+        WITH today_bars AS (
+            SELECT * FROM kdata WHERE date = (SELECT MAX(date) FROM kdata)
+        ),
+        prev_day AS (
+            SELECT k.symbol, k.close AS prev_close
+            FROM kdata k
+            WHERE k.date = (SELECT MAX(date) FROM kdata WHERE date < (SELECT MAX(date) FROM kdata))
+        )
+        SELECT {col} AS 分组,
+               count(*)                                AS 股票数,
+               ROUND(AVG((t.close - p.prev_close) / NULLIF(p.prev_close, 0) * 100), 2) AS 涨幅_pct,
+               ROUND(SUM(t.amount)/1e8, 0)             AS 总成交额_亿,
+               ROUND(AVG(b.市净率), 2)                 AS 行业PB,
+               ROUND(AVG(b.净利润率), 2)                 AS ROE_pct,
+               ROUND(AVG(b.毛利率), 1)                 AS 毛利率_pct,
+               ROUND(AVG(b.收入同比), 2)               AS 收入同比_pct,
+               ROUND(AVG(b.利润同比), 2)               AS 净利同比_pct
+        FROM stock_basic b
+        JOIN today_bars t ON b.代码 = t.symbol
+        JOIN prev_day p ON b.代码 = p.symbol
+        WHERE {col} IS NOT NULL AND {col} != ''
+        GROUP BY {col}
+        HAVING count(*) >= 5
+        ORDER BY 涨幅_pct DESC
+    """
+    df = con.execute(sql).df()
+
+    tab1, tab2, tab3 = st.tabs(["📊 涨幅榜", "💰 财务质量榜", "🔥 资金活跃榜"])
+    with tab1:
+        st.dataframe(df.head(30), width='stretch', height=500)
+    with tab2:
+        st.dataframe(df.sort_values("ROE_pct", ascending=False).head(30),
+                     width='stretch', height=500)
+    with tab3:
+        st.dataframe(df.sort_values("总成交额_亿", ascending=False).head(30),
+                     width='stretch', height=500)
+
+    st.divider()
+    st.subheader("🎯 行业涨幅 vs 财务质量 散点图")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["ROE_pct"], y=df["涨幅_pct"],
+        mode="markers+text",
+        text=df["分组"], textposition="top center",
+        marker=dict(
+            size=df["股票数"], sizemode="area",
+            sizeref=2.*max(df["股票数"])/(40.**2), sizemin=4,
+            color=df["行业PB"], colorscale="Viridis", showscale=True,
+            colorbar=dict(title="行业PB")),
+        hovertemplate="<b>%{text}</b><br>ROE: %{x:.1f}%<br>涨幅: %{y:.2f}%<br>PB: %{marker.color:.2f}<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+    fig.update_layout(height=600, xaxis_title="行业平均 ROE (%)", yaxis_title="涨幅 (%)")
+    st.plotly_chart(fig, width='stretch')
+
+
+# ============================================================
+# 页面 11: SQL 控制台 (2026-06-19 整合自老 app.py)
+# stock_basic 是静态基本面 (53 列), 动态指标需从 kdata 算
+# ============================================================
+elif page == "💻 SQL 控制台":
+    st.header("💻 SQL 控制台")
+    st.caption("""
+可用视图/表:
+- `kdata` (TABLE, 16M+ 行: symbol, date, open, high, low, close, volume, amount)
+- `asi_yearly` / `asi_yearly_up` (VIEW: year, asi_sum, asi_yearly_rank, top50_days, ...)
+- `stock_basic` (VIEW: 53 列静态基本面: 代码/名称/细分行业/地区/上市日期/市净率/市销率/市现率/净利润率/毛利率/营业利润率/净利润率/收入同比/利润同比/总股本_亿/B/A股_亿/...)
+- `stock_slim` (TABLE: symbol/name/industry/region/listing_date, 物化加速用)
+""")
+    default_sql = """-- 茅台/宁德/比亚迪 财务对比 (静态基本面 + 当日行情)
+SELECT
+    b.代码, b.名称, b.细分行业 AS 行业, b.地区,
+    ROUND(t.close, 2)        AS 收盘,
+    ROUND(b.市净率, 2)       AS PB,
+    ROUND(b.市销率, 2)       AS PS,
+    ROUND(b.市现率, 2)       AS PCF,
+    ROUND(b.净利润率, 2)       AS ROE,
+    ROUND(b.毛利率, 1)       AS 毛利率,
+    ROUND(b.营业利润率, 1)   AS 营业利润率,
+    ROUND(b.净利润率, 1)     AS 净利率,
+    ROUND(b.收入同比, 1)     AS 营收同比,
+    ROUND(b.利润同比, 1)     AS 净利同比
+FROM stock_basic b
+JOIN (SELECT * FROM kdata WHERE date = (SELECT MAX(date) FROM kdata)) t
+  ON b.代码 = t.symbol
+WHERE b.代码 IN ('600519','300750','002594')
+ORDER BY b.代码;"""
+    sql = st.text_area("SQL", value=default_sql, height=300, key='sql_console')
+
+    if st.button("执行 ▶", type="primary", key='sql_run'):
+        con = get_con()
+        try:
+            t0 = time.time()
+            df = con.execute(sql).df()
+            ms = (time.time() - t0) * 1000
+            st.success(f"✅ {len(df)} 行, {ms:.0f} ms")
+            st.dataframe(df, width='stretch')
+            if not df.empty:
+                st.download_button("下载 CSV", df.to_csv(index=False).encode("utf-8-sig"),
+                                   "result.csv", "text/csv", key='sql_dl')
+        except Exception as e:
+            st.error(f"❌ {e}")
+
+
+st.caption("--- 数据源: ~/stock_data/*.parquet | Powered by Streamlit + DuckDB + Plotly")

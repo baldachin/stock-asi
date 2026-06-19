@@ -10,15 +10,15 @@ import matplotlib.font_manager as fm
 from scipy import stats
 import os
 
-SC_FONT = '/home/hanshuang8902/.cache/camoufox/fonts/linux/NotoSansSC-Regular.otf'
+SC_FONT = ''
 fm.fontManager.addfont(SC_FONT)
 sc_prop = fm.FontProperties(fname=SC_FONT)
 plt.rcParams['font.family'] = ['Noto Sans SC', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 STOCK_NAME = '兆易创新'
-DATA_PATH = '/home/hanshuang8902/stock/report_gen/stock_兆易创新.csv'
-IMG_DIR = '/home/hanshuang8902/stock/report_gen'
+DATA_PATH = 'F:/Develops/stock-asi/report_gen/stock_兆易创新.csv'
+IMG_DIR = 'F:/Develops/stock-asi/report_gen'
 
 def load_data():
     df = pd.read_csv(DATA_PATH, parse_dates=['date'])

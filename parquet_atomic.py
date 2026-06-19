@@ -1,7 +1,7 @@
 """
 Parquet 原子写入 helper
 
-提供 write_atomic(table, path) - 写到 .tmp 文件，fsync，原子 rename
+提供 write_atomic(table, path) - 写到 .tmp 文件，fsync (POSIX)，原子 rename
 避免 writer crash 时留下半写文件
 
 为什么需要这个:
@@ -15,10 +15,19 @@ Parquet 原子写入 helper
 
     table = pa.table({"date": [...], "amount": [...]})
     write_atomic(table, "/path/to/data.parquet")
+
+跨平台说明:
+- POSIX: 写 .tmp → os.fsync → os.replace
+- Windows: os.fsync 在 O_RDONLY 句柄上有时返回 EBADF; 退化为写 .tmp → close → os.replace
+  (Windows ReplaceFile / MoveFileEx 仍提供原子语义, 单文件场景下足够安全)
 """
 
 import os
+import sys
 import pyarrow.parquet as pq
+
+# Windows 上跳过 fsync (O_RDONLY 句柄 fsync 不可靠, 但 MoveFileEx 仍原子)
+_IS_WINDOWS = sys.platform == "win32"
 
 
 def write_atomic(table, target_path: str, compression: str = "snappy",
@@ -26,8 +35,8 @@ def write_atomic(table, target_path: str, compression: str = "snappy",
     """原子写入 Parquet 文件
 
     1. 写到 {target_path}.tmp
-    2. fsync 强制刷盘 (防止 power loss 后文件内容为 0)
-    3. os.replace 原子 rename (POSIX 保证)
+    2. (POSIX) fsync 强制刷盘 - 防止 power loss 后文件内容为 0
+    3. os.replace 原子 rename
 
     Args:
         table: pyarrow.Table
@@ -46,13 +55,19 @@ def write_atomic(table, target_path: str, compression: str = "snappy",
         **kwargs
     )
 
-    # 2. fsync - 强制 OS 把 page cache 刷到磁盘
+    # 2. fsync - POSIX 强制 OS 把 page cache 刷到磁盘
     #    没有 fsync, kernel panic / power loss 可能让文件内容为 0
-    fd = os.open(tmp_path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    #    Windows 上 O_RDONLY 句柄 fsync 不可靠, 跳过; MoveFileEx 仍原子
+    if not _IS_WINDOWS:
+        try:
+            fd = os.open(tmp_path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            # 极个别 FS 不支持 fsync, 跳过即可
+            pass
 
-    # 3. 原子 rename - POSIX 单文件系统下永不半成功
+    # 3. 原子 rename - POSIX/Windows 单文件系统下永不半成功
     os.replace(tmp_path, target_path)
