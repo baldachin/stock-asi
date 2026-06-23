@@ -17,8 +17,8 @@ plt.rcParams['font.family'] = ['Noto Sans SC', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 STOCK_NAME = '兆易创新'
-DATA_PATH = 'F:/Develops/stock-asi/report_gen/stock_兆易创新.csv'
-IMG_DIR = 'F:/Develops/stock-asi/report_gen'
+DATA_PATH = '~/stock/report_gen/stock_兆易创新.csv'
+IMG_DIR = '~/stock/report_gen'
 
 def load_data():
     df = pd.read_csv(DATA_PATH, parse_dates=['date'])

@@ -41,18 +41,18 @@ except ImportError:
         msvcrt = None
         _HAS_MSVCRT = False
 
-sys.path.insert(0, 'F:/Develops/stock-asi')
+sys.path.insert(0, '~/stock')
 from parquet_atomic import write_atomic
 
 # ---------- 配置 ----------
-PARQUET_PATH = 'F:/Develops/stock_data/kdata.parquet'
+PARQUET_PATH = '~/stock_data/kdata.parquet'
 BATCH_SIZE  = 50           # 每批股票数
 MAX_RETRIES = 3
 DAYS_BACK   = 15           # 每次多抓几天防止遗漏
 CROP_DAYS   = 30           # 合并时裁掉最后 30 天, 避免与已有 recent 数据重复
 # ----------------------------
 
-LOCK_FILE = 'F:/Develops/stock_data/update_kdata_parquet.lock'
+LOCK_FILE = '~/stock_data/update_kdata_parquet.lock'
 
 def acquire_lock():
     """单例锁: 防止多个 update 进程同时跑 (POSIX fcntl / Windows msvcrt)"""

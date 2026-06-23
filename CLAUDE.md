@@ -107,8 +107,40 @@ A股数据分析和ASI（成交额强度指标）计算系统。数据从腾讯�
 ## 依赖
 
 - `baostock` - Baostock股票列表和历史数据
-- `pandas`, `pyarrow` - 数据处理和Parquet存储
+- `pandas`, `pyarrow` - 数据分析和Parquet存储
 - `numpy` - 数值计算
 - `duckdb` (in-memory only, 不再创建 .db 文件) - dashboard/asi_calculator 的 SQL 引擎
 - `psutil` - 内存监控 (开发期使用)
+- `streamlit`, `plotly` - dashboard 可视化
 - 无测试套件
+
+## 数据路径与跨平台约定 (2026-06-19)
+
+**本地 (Linux) 默认路径** (由 `os.path.expanduser` 展开 `~`):
+- 数据: `~/stock_data/{kdata,asi_yearly,asi_yearly_up,stock_basic}.parquet`
+- 脚本: `~/stock/{update_kdata_parquet.py,dashboard.py,...}`
+- 锁文件: `~/stock_data/update_kdata_parquet.lock`
+
+**环境变量覆盖** (dashboard.py 支持):
+- `STOCK_KDATA` / `STOCK_ASI` / `STOCK_ASI_UP` / `STOCK_BASIC` — 覆盖 Parquet 文件路径
+
+**Windows 端工具 (仅 braveyun dev 环境使用, 本地不调用)**:
+- `_patch_paths.py` — 批量替换仓库内硬编码路径 (Linux → Windows)
+- `_download_kdata_fast.py` — Baostock → Parquet 并发下载 (10-stock 批)
+- `_import_tdx.py` — TDX 导出文件 → kdata.parquet
+- `_diag_tdx.py` — TDX 解析性能诊断
+- `DEPLOY.md` — Windows 端本地部署说明
+
+这些工具内部硬编码 `F:/Develops/...` 或 `F:\\Develops\\...`，本地 Linux 不要运行。`.gitignore` 已忽略 `_download_progress.txt`、`_*.log` 等临时产物。
+
+## Dashboard 加速 (2026-06-19 50e3296)
+
+dashboard.py 关键改动:
+- `@st.cache_resource` on `get_con()` — 跨页/跨用户共享同一个 DuckDB 连接
+- `kdata` VIEW → TABLE 物化 — 16M 行一次性扫描后, 查询提速 50-100x
+- `SET threads=8` + `enable_object_cache=true`
+- `@st.cache_data` (TTL=1h) on `symbols/industries/regions/date_range`
+- mtime 自动失效 + 数据快照时间戳显示
+- 4 个新页面: 筛选检索 / 排行榜 / 行业概览 / SQL 控制台
+- 个股 K线 页: 周/月 resample
+- `width='stretch'` 取代 `use_container_width=True` (Streamlit 1.58 deprecation)

@@ -23,7 +23,7 @@ import duckdb
 import time
 from datetime import datetime
 
-DB = 'F:/Develops/stock_data/stock.db'
+DB = '~/stock_data/stock.db'
 K = 3.0  # 灵敏度参数, 越大越不敏感
 
 def _connect_with_retry(max_attempts=20, base_sleep=3.0):

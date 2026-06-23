@@ -13,8 +13,8 @@ from datetime import datetime, date
 import duckdb
 
 # ---------- 配置 ----------
-KDATA_PATH     = 'F:/Develops/stock_data/kdata.parquet'
-STOCK_BASIC    = 'F:/Develops/stock_data/stock_basic.parquet'
+KDATA_PATH     = '~/stock_data/kdata.parquet'
+STOCK_BASIC    = '~/stock_data/stock_basic.parquet'
 NOTION_API_KEY = os.environ.get('NOTION_API_KEY', '')
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_API_KEY}",

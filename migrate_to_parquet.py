@@ -22,11 +22,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from datetime import datetime
 
-sys.path.insert(0, 'F:/Develops/stock-asi')
+sys.path.insert(0, '~/stock')
 from parquet_atomic import write_atomic
 
-DUCKDB_PATH = 'F:/Develops/stock_data/stock.db'
-PARQUET_DIR = 'F:/Develops/stock_data'
+DUCKDB_PATH = '~/stock_data/stock.db'
+PARQUET_DIR = '~/stock_data'
 
 def check_no_holders():
     import subprocess

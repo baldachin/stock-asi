@@ -9,7 +9,7 @@ import baostock as bs
 import time
 from datetime import datetime
 
-DB = 'F:/Develops/stock_data/stock.db'
+DB = '~/stock_data/stock.db'
 BATCH_SIZE = 50
 
 def get_2026_symbols_with_zero():

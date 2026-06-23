@@ -16,8 +16,8 @@ from datetime import datetime
 import os
 
 # ========== 配置 ==========
-KDATA_PATH = 'F:/Develops/stock-asi/kdata.parquet'
-OUTPUT_PATH = 'F:/Develops/stock_data/asi_yearly.parquet'
+KDATA_PATH = '~/stock/kdata.parquet'
+OUTPUT_PATH = '~/stock_data/asi_yearly.parquet'
 TOP_N_LIST = [50, 100]  # 统计进入前N名的天数
 
 # ========== 核心计算函数 ==========

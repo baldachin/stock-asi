@@ -6,7 +6,7 @@ import duckdb
 import pandas as pd
 import pyarrow.parquet as pq
 
-DB = 'F:/Develops/stock-asi/stock.db'
+DB = '~/stock/stock.db'
 
 conn = duckdb.connect(DB)
 

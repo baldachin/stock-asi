@@ -4,7 +4,7 @@
 """
 import duckdb
 
-DB = 'F:/Develops/stock_data/stock.db'
+DB = '~/stock_data/stock.db'
 
 conn = duckdb.connect(DB)
 conn.execute("CREATE SEQUENCE IF NOT EXISTS kdata_id_seq START 1")

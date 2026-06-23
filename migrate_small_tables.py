@@ -17,11 +17,11 @@ import duckdb
 import pyarrow as pa
 from datetime import datetime
 
-sys.path.insert(0, 'F:/Develops/stock-asi')
+sys.path.insert(0, '~/stock')
 from parquet_atomic import write_atomic
 
-DUCKDB_PATH = 'F:/Develops/stock_data/stock.db'
-PARQUET_DIR = 'F:/Develops/stock_data'
+DUCKDB_PATH = '~/stock_data/stock.db'
+PARQUET_DIR = '~/stock_data'
 
 TABLES = [
     ('asi_yearly',    f'{PARQUET_DIR}/asi_yearly.parquet'),

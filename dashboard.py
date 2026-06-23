@@ -5,7 +5,7 @@ A股数据可视化面板 (Streamlit)
 - 同业对比
 - 行业强弱热力图
 
-启动: /home/braveyun/stock-asi-new/venv/bin/streamlit run /home/braveyun/stock-asi-new/stock-asi/dashboard.py --server.port 8502
+启动: ~/stock/.venv/bin/streamlit run ~/stock/dashboard.py --server.port 8502
 默认: http://localhost:8501
 """
 import streamlit as st
@@ -22,10 +22,11 @@ import threading
 # ---------- 配置 ----------
 # 数据源: Parquet 文件 (无锁, 持久, 原子替换)
 # 2026-06-05 迁移: 从 DuckDB stock.db 改为 4 个独立 Parquet 文件
-KDATA_PATH    = os.environ.get('STOCK_KDATA',   '/home/braveyun/stock_data/kdata.parquet')
-ASI_PATH      = os.environ.get('STOCK_ASI',     '/home/braveyun/stock_data/asi_yearly.parquet')
-ASI_UP_PATH   = os.environ.get('STOCK_ASI_UP',  '/home/braveyun/stock_data/asi_yearly_up.parquet')
-BASIC_PATH    = os.environ.get('STOCK_BASIC',   '/home/braveyun/stock_data/stock_basic.parquet')
+# 支持 STOCK_KDATA / STOCK_ASI / STOCK_ASI_UP / STOCK_BASIC 环境变量覆盖 (默认 ~/stock_data/...)
+KDATA_PATH    = os.path.expanduser(os.environ.get('STOCK_KDATA',   '~/stock_data/kdata.parquet'))
+ASI_PATH      = os.path.expanduser(os.environ.get('STOCK_ASI',     '~/stock_data/asi_yearly.parquet'))
+ASI_UP_PATH   = os.path.expanduser(os.environ.get('STOCK_ASI_UP',  '~/stock_data/asi_yearly_up.parquet'))
+BASIC_PATH    = os.path.expanduser(os.environ.get('STOCK_BASIC',   '~/stock_data/stock_basic.parquet'))
 
 # 中文字体 (Camoufox 缓存的 NotoSansSC) — plotly 自带字体回退机制
 # 不需要 matplotlib（dashboard 全程用 plotly 画图）
@@ -1308,8 +1309,8 @@ elif page == "🎯 低吸观察池":
         """v2 低吸观察池: 5 个切片, 每次切都用同一基础数据 (asi + kdata + basic)
         返回 dict: slice_name -> DataFrame
         """
-        KDATA = os.environ.get('STOCK_KDATA', '/home/braveyun/stock_data/kdata.parquet')
-        ASI   = os.environ.get('STOCK_ASI', '/home/braveyun/stock_data/asi_yearly.parquet')
+        KDATA = os.path.expanduser(os.environ.get('STOCK_KDATA', '~/stock_data/kdata.parquet'))
+        ASI   = os.path.expanduser(os.environ.get('STOCK_ASI', '~/stock_data/asi_yearly.parquet'))
 
         con = duckdb.connect(':memory:')
         con.execute(f"CREATE VIEW kdata AS SELECT * FROM read_parquet('{KDATA}')")

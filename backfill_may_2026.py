@@ -23,9 +23,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from datetime import date, datetime
 
-PARQUET_PATH = 'F:/Develops/stock_data/kdata.parquet'
-OLD_DB_PATH  = 'F:/Develops/stock_data/stock.db'
-BACKUP_PATH  = 'F:/Develops/stock_data/kdata.parquet.pre_may_backfill'
+PARQUET_PATH = '~/stock_data/kdata.parquet'
+OLD_DB_PATH  = '~/stock_data/stock.db'
+BACKUP_PATH  = '~/stock_data/kdata.parquet.pre_may_backfill'
 
 DATE_START = date(2026, 5, 6)
 DATE_END   = date(2026, 5, 20)
