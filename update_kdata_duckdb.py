@@ -19,13 +19,13 @@ import sys
 from datetime import datetime, date, timedelta
 
 # ---------- 配置 ----------
-DB_PATH = '~/stock_data/stock.db'
+DB_PATH = os.path.expanduser('~/stock_data/stock.db')
 BATCH_SIZE  = 50           # 每批股票数（单连接连续请求）
 MAX_RETRIES = 3
 DAYS_BACK   = 15           # 每次多抓几天防止遗漏
 # ----------------------------
 
-LOCK_FILE = '/tmp/update_kdata_duckdb.lock'
+LOCK_FILE = os.path.expanduser('~/stock_data/update_kdata_duckdb.lock')
 
 def acquire_lock():
     """单例锁：防止多个 update 进程同时跑（hermes-gateway 偶尔会触发）"""

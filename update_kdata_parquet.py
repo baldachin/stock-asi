@@ -41,18 +41,18 @@ except ImportError:
         msvcrt = None
         _HAS_MSVCRT = False
 
-sys.path.insert(0, '~/stock')
+sys.path.insert(0, os.path.expanduser('~/stock'))
 from parquet_atomic import write_atomic
 
 # ---------- 配置 ----------
-PARQUET_PATH = '~/stock_data/kdata.parquet'
+PARQUET_PATH = os.path.expanduser('~/stock_data/kdata.parquet')
 BATCH_SIZE  = 50           # 每批股票数
 MAX_RETRIES = 3
-DAYS_BACK   = 15           # 每次多抓几天防止遗漏
+DAYS_BACK   = 30           # 每次多抓几天防止遗漏 (必须 >= CROP_DAYS, 否则会丢数据)
 CROP_DAYS   = 30           # 合并时裁掉最后 30 天, 避免与已有 recent 数据重复
 # ----------------------------
 
-LOCK_FILE = '~/stock_data/update_kdata_parquet.lock'
+LOCK_FILE = os.path.expanduser('~/stock_data/update_kdata_parquet.lock')
 
 def acquire_lock():
     """单例锁: 防止多个 update 进程同时跑 (POSIX fcntl / Windows msvcrt)"""
@@ -201,6 +201,19 @@ def merge_and_write(df_new):
     # 读老数据, 裁掉最后 CROP_DAYS 天 (这些天会被 df_new 覆盖)
     last_date = get_last_date_from_parquet()
     crop_date = last_date - timedelta(days=CROP_DAYS)
+
+    # 2026-06-23: 数据安全校验 — 如果 crop_date 比 df_new 最小日期还大,
+    # 说明 df_new 没完全覆盖裁切窗口, 裁切会永久丢失中间数据 → abort
+    if not df_new.empty:
+        df_new_min_date = df_new['date'].min()
+        if isinstance(df_new_min_date, str):
+            df_new_min_date = pd.to_datetime(df_new_min_date).date()
+        if crop_date > df_new_min_date:
+            msg = (f'[FATAL] crop_date={crop_date} > df_new.min_date={df_new_min_date}, '
+                   f'裁切窗口未被新数据完全覆盖, 拒绝写入以防数据丢失. '
+                   f'增加 DAYS_BACK 或手动修复.')
+            print(msg, flush=True)
+            raise RuntimeError(msg)
     print(f"\n[Step4] 流式重写 kdata.parquet (裁掉 {crop_date} 之后)...")
 
     # 流式: 用 ParquetWriter 逐 row group 写
@@ -224,6 +237,15 @@ def merge_and_write(df_new):
 
     # 写新数据
     if not df_new.empty:
+        # 2026-06-23: 去重 (按 symbol+date 保留最后一条)
+        # 原因: DAYS_BACK=CROP_DAYS=30 时, 多次 cron 跑可能导致同一 (symbol, date) 多次出现
+        #       writer 用追加写入不去重, 不 dedup 会让行数虚高且 ASI 计算错误
+        before = len(df_new)
+        df_new = df_new.sort_values(['symbol', 'date']).drop_duplicates(['symbol', 'date'], keep='last')
+        after = len(df_new)
+        if before != after:
+            print(f"  去重: {before:,} → {after:,} 行 (移除 {before-after:,} 重复)")
+
         # 1) 对齐列: 原文件有 'id' 列 (DuckDB 时代的 PK), df_new 没有
         if 'id' in orig_schema.names:
             start_id = get_max_id_from_parquet()

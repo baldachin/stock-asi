@@ -34,6 +34,13 @@ for attempt in 1 2 3; do
     echo "[$(date)] 第 $attempt/3 次尝试" >> "$LOG"
     if /home/hanshuang8902/stock/.venv/bin/python /home/hanshuang8902/stock/update_kdata_parquet.py >> "$LOG" 2>&1; then
         echo "[$(date)] ✓ writer 成功" >> "$LOG"
+        # 2026-06-23: writer 成功后重建窗口版 parquet, 给 dashboard 加速用
+        echo "[$(date)] 重建窗口版 parquet (5y)..." >> "$LOG"
+        if /home/hanshuang8902/stock/.venv/bin/python /home/hanshuang8902/stock/build_window_parquet.py --years 5 >> "$LOG" 2>&1; then
+            echo "[$(date)] ✓ 窗口版 parquet 重建完成" >> "$LOG"
+        else
+            echo "[$(date)] ⚠ 窗口版重建失败 (不影响 dashboard, 会降级用全量)" >> "$LOG"
+        fi
         exit 0
     else
         echo "[$(date)] ✗ writer 失败 (第 $attempt 次)" >> "$LOG"

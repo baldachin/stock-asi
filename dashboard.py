@@ -22,8 +22,12 @@ import threading
 # ---------- 配置 ----------
 # 数据源: Parquet 文件 (无锁, 持久, 原子替换)
 # 2026-06-05 迁移: 从 DuckDB stock.db 改为 4 个独立 Parquet 文件
-# 支持 STOCK_KDATA / STOCK_ASI / STOCK_ASI_UP / STOCK_BASIC 环境变量覆盖 (默认 ~/stock_data/...)
-KDATA_PATH    = os.path.expanduser(os.environ.get('STOCK_KDATA',   '~/stock_data/kdata.parquet'))
+# 支持 STOCK_KDATA / STOCK_KDATA_WINDOW / STOCK_ASI / STOCK_ASI_UP / STOCK_BASIC 环境变量覆盖 (默认 ~/stock_data/...)
+KDATA_PATH    = os.path.expanduser(os.environ.get('STOCK_KDATA',        '~/stock_data/kdata.parquet'))
+# 2026-06-23 窗口 parquet: 裁掉 1990s 历史数据, 物化内存从 ~3.7GB 降到 ~1.3GB (5y) / ~530MB (2y)
+# 优先用 window 版 (~/stock_data/kdata_5y.parquet), 不存在时降级到 STOCK_KDATA + WHERE 过滤
+WINDOW_YEARS  = int(os.environ.get('STOCK_WINDOW_YEARS', '5'))
+WINDOW_PATH   = os.path.expanduser(os.environ.get('STOCK_KDATA_WINDOW', f'~/stock_data/kdata_{WINDOW_YEARS}y.parquet'))
 ASI_PATH      = os.path.expanduser(os.environ.get('STOCK_ASI',     '~/stock_data/asi_yearly.parquet'))
 ASI_UP_PATH   = os.path.expanduser(os.environ.get('STOCK_ASI_UP',  '~/stock_data/asi_yearly_up.parquet'))
 BASIC_PATH    = os.path.expanduser(os.environ.get('STOCK_BASIC',   '~/stock_data/stock_basic.parquet'))
@@ -57,22 +61,36 @@ def get_con():
     - SET enable_object_cache=true (parquet metadata 跨查询缓存)
     - stock_basic 物化出 slim 表 (代码/名称/行业/地区/上市日期) — 各排名页 JOIN 必备
 
+    2026-06-23 窗口优化:
+    - 优先读 kdata_{N}y.parquet (裁掉 1990s 历史), 内存峰值从 ~3.7GB 降到 ~1.3GB (5y)
+    - 不存在时降级到 KDATA_PATH + WHERE date >= MAX(date) - INTERVAL (零额外磁盘)
+    - threads=2 (本地 2 核, 8 线程会线程争抢)
+
     线程安全说明:
     - DuckDB 1.5+ 默认每个 connection 独立 state, 单线程内安全
     - Streamlit 偶发同 session 多线程 (eg 按钮 click 与 auto-refresh 重叠)
       会触发 "Different thread" 错误, 所以加 RLock 保护
     """
     con = duckdb.connect(':memory:')
-    # 性能调优 (来自老 app.py 验证)
-    con.execute("SET threads TO 8")
+    # 性能调优 (本地 2 核机器: threads=2 足够, 8 会争抢)
+    con.execute("SET threads TO 2")
     con.execute("SET enable_object_cache TO true")
 
-    # kdata: VIEW 改 TABLE (kdata 16M+ 行, 物化后查询从 2-5s 降到 50-100ms)
-    if os.path.exists(KDATA_PATH):
+    # kdata: 优先用 window parquet (裁掉历史数据, 内存峰值显著降低)
+    if os.path.exists(WINDOW_PATH):
+        # 直接物化小文件, 不需要 filter
+        con.execute(f"""
+            CREATE OR REPLACE TABLE kdata AS
+            SELECT symbol, date, open, high, low, close, volume, amount
+            FROM read_parquet('{WINDOW_PATH}')
+        """)
+    elif os.path.exists(KDATA_PATH):
+        # 降级: 全量 + WHERE 过滤 (内存峰值不变, 但兼容性更好)
         con.execute(f"""
             CREATE OR REPLACE TABLE kdata AS
             SELECT symbol, date, open, high, low, close, volume, amount
             FROM read_parquet('{KDATA_PATH}')
+            WHERE date >= (SELECT MAX(date) FROM read_parquet('{KDATA_PATH}')) - INTERVAL '{WINDOW_YEARS} years'
         """)
 
     # asi_yearly 两个口径 — 体积小, VIEW 即可
@@ -155,7 +173,8 @@ def get_kpi() -> dict:
     con = get_con()
     total_stocks = con.execute("SELECT COUNT(DISTINCT symbol) FROM kdata").fetchone()[0]
     date_range = con.execute("SELECT MIN(date), MAX(date) FROM kdata").fetchone()
-    date_range = (date_range[0].date(), date_range[1].date())
+    date_range = (date_range[0].date() if hasattr(date_range[0], 'date') else date_range[0],
+                   date_range[1].date() if hasattr(date_range[1], 'date') else date_range[1])
     total_rows = con.execute("SELECT COUNT(*) FROM kdata").fetchone()[0]
     return dict(total_stocks=total_stocks, date_range=date_range, total_rows=total_rows)
 
