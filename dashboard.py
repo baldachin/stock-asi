@@ -31,6 +31,7 @@ WINDOW_PATH   = os.path.expanduser(os.environ.get('STOCK_KDATA_WINDOW', f'~/stoc
 ASI_PATH      = os.path.expanduser(os.environ.get('STOCK_ASI',     '~/stock_data/asi_yearly.parquet'))
 ASI_UP_PATH   = os.path.expanduser(os.environ.get('STOCK_ASI_UP',  '~/stock_data/asi_yearly_up.parquet'))
 BASIC_PATH    = os.path.expanduser(os.environ.get('STOCK_BASIC',   '~/stock_data/stock_basic.parquet'))
+HEAT_PATH     = os.path.expanduser(os.environ.get('STOCK_HEAT',     '~/stock_data/heat_rotation_daily.parquet'))
 
 # 中文字体 (Camoufox 缓存的 NotoSansSC) — plotly 自带字体回退机制
 # 不需要 matplotlib（dashboard 全程用 plotly 画图）
@@ -799,9 +800,15 @@ with st.sidebar:
 
     st.divider()
     # mtime 自动清缓存 (数据更新后下次访问自动重查)
+    # 注意: 必须包含 dashboard 实际读的 WINDOW_PATH 和 HEAT_PATH,
+    # 否则 writer 重建 window 或 sync_heat 写盘不会触发 cache_resource 失效
     DATA_SOURCES = [
-        Path(KDATA_PATH), Path(ASI_PATH), Path(ASI_UP_PATH), Path(BASIC_PATH),
+        Path(KDATA_PATH),
+        Path(WINDOW_PATH) if os.path.exists(WINDOW_PATH) else None,
+        Path(ASI_PATH), Path(ASI_UP_PATH), Path(BASIC_PATH),
+        Path(HEAT_PATH) if os.path.exists(HEAT_PATH) else None,
     ]
+    DATA_SOURCES = [p for p in DATA_SOURCES if p is not None]
     def _latest_mtime() -> float:
         ms = []
         for p in DATA_SOURCES:
