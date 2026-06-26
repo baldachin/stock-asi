@@ -40,8 +40,167 @@ st.set_page_config(
     page_title="A股数据面板",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
+
+# ---------- 页面说明 (可折叠, 默认收起) ----------
+# 12 个页面每个一份说明, 解释功能/计算方式/如何观察
+# 用法: 在每个页面 st.header 后调用 page_help("个股K线")
+PAGE_HELP = {
+    "🏠 总览": """
+**功能**：一眼看当前 A 股大盘 + 自选股的整体状况。
+
+**统计项**：
+- 📦 总股票数：过滤 ST 与停牌后的活跃标的数
+- 📅 数据范围：kdata parquet 中最早到最晚的交易日
+- 💾 总行数：所有 K 线记录的累计行数（包含 1990 年至今）
+
+**观察方式**：先看"今日成交额"折线趋势判断市场冷热；右侧行业/地区分布了解结构。
+""",
+
+    "📊 个股K线": """
+**功能**：单只票的完整 K 线 + 衍生指标（ASI / RPS）。
+
+**统计项**：
+- ASI (0-100)：基于成交额百分位排名 + 涨跌幅加权的日强度，年度聚合为 ASI_sum
+- RPS (5/10/20/60/120 周期)：个股涨幅在 N 日窗口内的全市场百分位排名
+- 个股 K 线子图：开盘/收盘/最高/最低 + 成交量 + 成交额 + ASI + RPS
+
+**观察方式**：RPS > 80 视为强势区；ASI 突变放大常对应放量事件。
+""",
+
+    "🏆 ASI 排名": """
+**功能**：按 ASI 得分排序的个股年度榜单。
+
+**统计项**：
+- asi_sum：年内每日 ASI 得分（0-100 加权）总和
+- asi_yearly_rank：年度 ASI 排名（1 = 年度最强）
+- top50_days / top100_days：年内进入全市场前 50/100 名次数
+- 上市满 N 年过滤：剔除次新股（默认 1 年）
+
+**计算方式**：`asi_yearly.parquet` 预计算，公式见 `~/stock/asi_calculator_parquet.py`。
+
+**观察方式**：asi_yearly_rank 越小越强；asi_sum + rank 同时看能过滤"偶然某天爆发"的票。
+""",
+
+    "📈 RPS 排名": """
+**功能**：多周期 RPS 排名榜单（5/10/20/60/120 日）。
+
+**统计项**：
+- rps_5 / rps_10 / rps_20 / rps_60 / rps_120：N 日涨跌幅的全市场百分位
+- ret_5d / ret_10d ...：对应周期内累计涨幅 %
+
+**计算方式**：实时 SQL 算，每只票 `PERCENT_RANK() OVER (PARTITION BY date ORDER BY ret_N)`。
+
+**观察方式**：多周期 RPS 同时 > 80 才是真强势；单周期高可能是反弹。
+""",
+
+    "🎯 低吸观察池": """
+**功能**：基于"长期强势 + 近期回调"逻辑的 5 切片候选池。
+
+**统计项**：v2-1 / v2-2 / v2-5 / v2-6 / v2-7 五个阈值组合
+- draw_60 / draw_250：从 60 / 250 日高点回撤幅度
+- rsi14：14 日相对强弱指标
+- amt_ratio：当日成交额 / 60 日均成交额
+- strong_years：连续强势年数（默认最近 2 年都进入 ASI Top 100）
+
+**计算方式**：详见 `~/.hermes/skills/stock-dip-pool/SKILL.md`。
+
+**观察方式**：每个 slice 输出控制在 30-50 只；多 slice 重叠的票优先关注。
+""",
+
+    "🏭 行业强度": """
+**功能**：按申万一级行业聚合的多日强度排名。
+
+**统计项**：
+- weighted_strength（涨跌幅加权）：avg(pct_rank × 涨跌幅%)，正值=强势
+- avg_strength（纯成交活跃度）：行业平均成交额百分位
+- stock_count：行业内股票数（过滤样本不足的行业）
+
+**计算方式**：`load_industry_strength()` 用 SQL 聚合 + 行业代码 join。
+
+**观察方式**：weighted_strength > 30 是强行业，< -10 是弱势行业；勾"仅上涨日"过滤恐慌出货噪音。
+""",
+
+    "⚖️ 同业对比": """
+**功能**：多只股票归一化净值对比图（起点 = 1.0）。
+
+**统计项**：
+- nav：每只票当日收盘价 / 起始日收盘价
+- 所有股票按同一基准归一化，可直接对比"谁跑赢"
+
+**计算方式**：`load_peer_compare()` pivot + 除以第 0 行。
+
+**观察方式**：从行业强度页跳来时已预设行业全部股票；从个股 K 线跳来时可手动选同业对手。
+""",
+
+    "🔥 热度轮动": """
+**功能**：观察资金/成交额在"昨天 → 今天"的迁移，捕捉升温/降温/留存信号。
+
+**统计项**：
+- heat_pct (0-100)：当日成交额在过去 N 个交易日窗口里的百分位排名
+- heating：昨天 heat < 50 AND 今天 heat >= 80（新爆发）
+- cooling：昨天 heat >= 80 AND 今天 heat < 50（失宠）
+- staying：两日都 >= 80（持续热门）
+- net_amt（资金加权净流入）：升温股成交额总和 - 降温股成交额总和
+
+**计算方式**：详见 `~/.hermes/skills/stock-heat-rotation/SKILL.md`。
+
+**观察方式**：升温榜 + 降温榜交叉看，能找到"资金从 X 行业流向 Y 行业"的板块轮动；多日趋势 tab 看连续 heating/cooling 的票更可靠（单日可能是噪声）。
+""",
+
+    "🔍 筛选检索": """
+**功能**：多维度组合筛选（财务指标 + 价格指标）。
+
+**统计项**：基于 stock_basic 静态基本面 + kdata 当日行情。
+- PB / PS / PCF / PE-TTM：估值指标
+- ROE / 毛利率 / 净利率：盈利能力
+- 收入同比 / 利润同比：成长性
+
+**观察方式**：先粗筛（市值 + 行业），再精筛（财务 + 价格），避免组合条件过严导致无结果。
+""",
+
+    "🏆 排行榜": """
+**功能**：常用排行榜（涨幅/成交额/换手率 Top N）。
+
+**统计项**：基于当日行情的多维度排序。
+- 涨幅榜 / 跌幅榜
+- 成交额榜 / 换手率榜
+- 量比榜（当日量 / 5 日均量）
+
+**观察方式**：结合"是否突破前期高点"判断持续性；纯涨幅榜容易捕捉到一字板无量上涨。
+""",
+
+    "🏭 行业概览": """
+**功能**：行业层面多维度扫描（涨幅 + 财务 + 资金）。
+
+**统计项**：
+- 行业涨跌幅 + 成交额 + 股票数
+- 行业平均 ROE / PB / 营收同比
+- 行业 vs 行业散点图（ROE × 涨幅）
+
+**观察方式**：找"高 ROE + 涨幅靠前"的行业 = 戴维斯双击候选；找"低 PB + 高 ROE"是被低估的洼地。
+""",
+
+    "💻 SQL 控制台": """
+**功能**：直接对 4 个 Parquet 写 SQL 查询，绕开 dashboard 封装。
+
+**可用视图/表**：
+- `kdata` (TABLE：symbol/date/open/high/low/close/volume/amount)
+- `asi_yearly` / `asi_yearly_up` (VIEW：年度 ASI 摘要)
+- `stock_basic` (VIEW：53 列静态基本面)
+- `stock_slim` (TABLE：symbol/name/industry/region/listing_date，物化加速)
+
+**观察方式**：debug 性质用，平时不必；想要的功能在前面 11 个页面找不到时来这里写 SQL。
+""",
+}
+
+def page_help(page_name):
+    """在每个页面 st.header 后调用，渲染可折叠说明。"""
+    text = PAGE_HELP.get(page_name)
+    if not text:
+        return
+    with st.expander("📖 功能说明", expanded=False):
+        st.markdown(text)
 
 # ---------- 数据加载 ----------
 # 2026-06-05: 改用 DuckDB in-memory 引擎直接读 Parquet 文件
@@ -854,6 +1013,7 @@ st.sidebar.info(
 # ============================================================
 if page == "🏠 总览":
     st.header("🏠 数据总览")
+    page_help("🏠 总览")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("股票数", f"{total_stocks:,}")
@@ -923,6 +1083,7 @@ if page == "🏠 总览":
 # ============================================================
 elif page == "📊 个股K线":
     st.header("📊 个股K线分析")
+    page_help("📊 个股K线")
 
     # 返回按钮 (从同业对比/行业强度跳来的, 才能返回)
     return_to = st.session_state.get('return_to', None)
@@ -1185,6 +1346,7 @@ elif page == "📊 个股K线":
 # ============================================================
 elif page == "🏆 ASI 排名":
     st.header("🏆 ASI 年度排名")
+    page_help("🏆 ASI 排名")
 
     asi = pd.read_parquet(ASI_PATH)
     years = sorted(asi['year'].unique().tolist(), reverse=True)
@@ -1287,6 +1449,7 @@ elif page == "🏆 ASI 排名":
 # ============================================================
 elif page == "📈 RPS 排名":
     st.header("📈 RPS 相对价格强度排名")
+    page_help("📈 RPS 排名")
     st.caption("RPS = Relative Price Strength，按涨跌幅百分位排名（0-100）。"
                "多周期交叉验证：5/10 日是短期动量，60/120 日是中长期强度。")
 
@@ -1419,6 +1582,7 @@ elif page == "📈 RPS 排名":
 # ============================================================
 elif page == "🏭 行业强度":
     st.header("🏭 行业强度")
+    page_help("🏭 行业强度")
 
     # 数据最新日（避免空数据）
     con_local = get_con()
@@ -1545,6 +1709,7 @@ elif page == "🏭 行业强度":
 # ============================================================
 elif page == "🎯 低吸观察池":
     st.header("🎯 低吸观察池")
+    page_help("🎯 低吸观察池")
     st.caption("筛选逻辑: 最近 2 年连续强势 (2024+2025 都 ASI 年度排名 p90+) + 当年高关注 (top100≥25) + 价格阶段性回调")
 
     @st.cache_data(ttl=3600)
@@ -1737,6 +1902,7 @@ elif page == "🎯 低吸观察池":
 # ============================================================
 elif page == "⚖️ 同业对比":
     st.header("⚖️ 同业对比 (归一化净值)")
+    page_help("⚖️ 同业对比")
 
     # 读 session_state 预设 (从行业强度页跳来的)
     preset_ind = st.session_state.pop('peer_industry_preset', None) if 'peer_industry_preset' in st.session_state else None
@@ -1834,6 +2000,7 @@ elif page == "⚖️ 同业对比":
 # ============================================================
 elif page == "🔍 筛选检索":
     st.header("🔍 筛选检索 (基本面 + 行情交叉)")
+    page_help("🔍 筛选检索")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1933,6 +2100,7 @@ elif page == "🔍 筛选检索":
 # ============================================================
 elif page == "🏆 排行榜":
     st.header("🏆 排行榜 (当日截面)")
+    page_help("🏆 排行榜")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -2004,6 +2172,7 @@ elif page == "🏆 排行榜":
 # ============================================================
 elif page == "🏭 行业概览":
     st.header("🏭 行业概览 (财务质量 + 涨幅 + 资金)")
+    page_help("🏭 行业概览")
 
     con = get_con()
     dim = st.radio("分组维度", ["行业", "地区"], horizontal=True, key='ind_overview_dim')
@@ -2072,6 +2241,7 @@ elif page == "🏭 行业概览":
 # ============================================================
 elif page == "🔥 热度轮动":
     st.header("🔥 热度轮动")
+    page_help("🔥 热度轮动")
     st.caption("""
 热度分 = 当日成交额在过去 N 个交易日窗口内的百分位排名 (0-100, 越高=成交额越异常放量)。
 样本 = 全 A, 过滤 ST 与上市不足 60 天。
@@ -2435,6 +2605,7 @@ elif page == "🔥 热度轮动":
 # ============================================================
 elif page == "💻 SQL 控制台":
     st.header("💻 SQL 控制台")
+    page_help("💻 SQL 控制台")
     st.caption("""
 可用视图/表:
 - `kdata` (TABLE, 16M+ 行: symbol, date, open, high, low, close, volume, amount)
