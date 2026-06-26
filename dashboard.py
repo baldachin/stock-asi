@@ -2175,9 +2175,11 @@ elif page == "🔥 热度轮动":
         ind_show = ind_view[['industry', 'total_stocks', 'heating_n', 'cooling_n',
                               'staying_n', 'net_flow', 'net_amt_yi',
                               'heating_amt_yi', 'cooling_amt_yi', 'heat_ratio_pct']]
+        # 列名固定, 两个指标都展示 (票数加权看 net_flow, 资金加权看 net_amt_yi)
         ind_show.columns = ['行业', '总股票数', '升温股数', '降温股数', '留存股数',
-                            '净流入(票数)', sort_col_display,
+                            '净流入(票数)', '净流入额(亿)',
                             '升温总额(亿)', '降温总额(亿)', '升温比例%']
+        st.caption(f"📊 当前排序口径: **{sort_col_display}**")
         st.dataframe(ind_show, width='stretch', height=600)
 
         # 横条图
