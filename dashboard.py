@@ -550,6 +550,223 @@ def load_peer_compare(symbols, start_date, end_date):
     normalized = pivoted / pivoted.iloc[0]
     return normalized.reset_index().melt(id_vars='date', var_name='symbol', value_name='nav')
 
+@st.cache_data(ttl=600)
+def compute_heat_rotation(window_days: int = 20, hot_th: float = 80.0, cold_th: float = 50.0):
+    """
+    热度轮动: 每只票每天一个热度分 (成交额在过去 window_days 天的百分位排名 0-100)
+    返回 side-by-side 两天对比 + 升温/降温/留存三类信号
+    过滤: 剔除 ST, 上市不足 60 天
+    """
+    con = get_con()
+    sql = f"""
+    WITH recent_per_symbol AS (
+        SELECT k.symbol, k.date, k.amount, k.close,
+               b.名称 AS name, b.细分行业 AS industry,
+               ROW_NUMBER() OVER (PARTITION BY k.symbol ORDER BY k.date DESC) AS rn_global
+        FROM kdata k
+        JOIN stock_basic b ON k.symbol = b.代码
+        WHERE k.date >= (SELECT MAX(date) FROM kdata) - INTERVAL '{window_days + 15} days'
+          AND b.名称 NOT LIKE '%ST%'
+          AND b.上市日期 <= (SELECT MAX(date) FROM kdata) - INTERVAL '60 days'
+    ),
+    recent_dates AS (
+        SELECT DISTINCT date FROM recent_per_symbol ORDER BY date DESC LIMIT 2
+    ),
+    target_days AS (
+        SELECT r.* FROM recent_per_symbol r
+        JOIN recent_dates d ON r.date = d.date
+    ),
+    hist_pairs AS (
+        SELECT t.symbol AS t_sym, t.date AS t_date,
+               t.amount AS t_amount, t.close, t.name, t.industry,
+               h.amount AS h_amount
+        FROM target_days t
+        JOIN recent_per_symbol h ON h.symbol = t.symbol
+        WHERE h.rn_global BETWEEN (t.rn_global + 1) AND (t.rn_global + {window_days})
+    ),
+    heat_t AS (
+        SELECT t_sym AS symbol, t_date AS eval_date, t_amount AS eval_amount,
+               close AS eval_close, name, industry,
+               SUM(CASE WHEN h_amount <= t_amount THEN 1 ELSE 0 END) * 100.0
+               / NULLIF(COUNT(*), 0) AS heat_pct
+        FROM hist_pairs
+        GROUP BY t_sym, t_date, t_amount, close, name, industry
+    ),
+    side_by_side AS (
+        SELECT symbol, name, industry,
+               MAX(CASE WHEN eval_date = (SELECT MAX(date) FROM kdata) THEN heat_pct END) AS heat_today,
+               MAX(CASE WHEN eval_date = (SELECT MAX(date) FROM kdata) THEN eval_close END) AS close_today,
+               MAX(CASE WHEN eval_date = (SELECT MAX(date) FROM kdata) THEN eval_amount END) AS amt_today,
+               MAX(CASE WHEN eval_date = (SELECT MAX(date) FROM kdata) - INTERVAL '1 day' THEN heat_pct END) AS heat_yest,
+               MAX(CASE WHEN eval_date = (SELECT MAX(date) FROM kdata) - INTERVAL '1 day' THEN eval_close END) AS close_yest,
+               MAX(CASE WHEN eval_date = (SELECT MAX(date) FROM kdata) - INTERVAL '1 day' THEN eval_amount END) AS amt_yest
+        FROM heat_t GROUP BY symbol, name, industry
+    )
+    SELECT *,
+           (close_today - close_yest) / close_yest * 100 AS ret_pct
+    FROM side_by_side
+    """
+    df = con.execute(sql).df()
+    today_str = str(con.execute("SELECT MAX(date) FROM kdata").fetchone()[0])
+    heating = df[(df['heat_yest'] < cold_th) & (df['heat_today'] >= hot_th)].copy()
+    cooling = df[(df['heat_yest'] >= hot_th) & (df['heat_today'] < cold_th)].copy()
+    staying = df[(df['heat_yest'] >= hot_th) & (df['heat_today'] >= hot_th)].copy()
+    heating = heating.sort_values('heat_today', ascending=False).reset_index(drop=True)
+    cooling = cooling.sort_values('heat_yest', ascending=False).reset_index(drop=True)
+    staying = staying.sort_values(['heat_today', 'heat_yest'], ascending=[False, False]).reset_index(drop=True)
+
+    # 行业汇总: 升温/降温/留存 按行业聚合 (净流入 = 升温股数 - 降温股数)
+    base_industry = df.dropna(subset=['industry']).copy()
+    base_industry['is_heating'] = (base_industry['heat_yest'] < cold_th) & (base_industry['heat_today'] >= hot_th)
+    base_industry['is_cooling'] = (base_industry['heat_yest'] >= hot_th) & (base_industry['heat_today'] < cold_th)
+    base_industry['is_staying'] = (base_industry['heat_yest'] >= hot_th) & (base_industry['heat_today'] >= hot_th)
+    base_industry['heating_amt'] = base_industry['amt_today'].where(base_industry['is_heating'], 0)
+    base_industry['cooling_amt'] = base_industry['amt_today'].where(base_industry['is_cooling'], 0)
+    industry_summary = base_industry.groupby('industry').agg(
+        total_stocks=('symbol', 'count'),
+        heating_n=('is_heating', 'sum'),
+        cooling_n=('is_cooling', 'sum'),
+        staying_n=('is_staying', 'sum'),
+        heating_amt=('heating_amt', 'sum'),
+        cooling_amt=('cooling_amt', 'sum'),
+    ).reset_index()
+    industry_summary['net_flow'] = industry_summary['heating_n'] - industry_summary['cooling_n']
+    industry_summary['net_amt'] = industry_summary['heating_amt'] - industry_summary['cooling_amt']
+    industry_summary['heat_ratio'] = industry_summary['heating_n'] / industry_summary['total_stocks']
+    # 默认按 net_amt 排序 (资金加权, 更接近真实资金流向)
+    industry_summary = industry_summary.sort_values('net_amt', ascending=False).reset_index(drop=True)
+
+    return heating, cooling, staying, industry_summary, today_str
+
+HEAT_PATH = os.path.expanduser("~/stock_data/heat_rotation_daily.parquet")
+
+@st.cache_data(ttl=600)
+def compute_heat_history(days: int = 5, window_days: int = 20,
+                         hot_th: float = 80.0, cold_th: float = 50.0):
+    """
+    多日热度: 返回最近 `days` 个交易日 的 long-format 数据 (date, symbol, heat_pct, amt, signal)
+    signal: 'heating' (前一日 heat<cold, 当日 heat>=hot) / 'cooling' (反向) /
+            'staying' (两日都 >= hot) / 'normal' (其他)
+    用 DENSE_RANK 取最近 `days` 个交易日, 避开周末/假期造成的 INTERVAL 误差
+    """
+    con = get_con()
+    lookback = days * 3 + window_days + 10  # 涵盖周末 + 节假日的安全余量
+    sql = f"""
+    WITH recent_per_symbol AS (
+        SELECT k.symbol, k.date, k.amount, k.close,
+               b.名称 AS name, b.细分行业 AS industry,
+               ROW_NUMBER() OVER (PARTITION BY k.symbol ORDER BY k.date DESC) AS rn_global
+        FROM kdata k
+        JOIN stock_basic b ON k.symbol = b.代码
+        WHERE k.date >= (SELECT MAX(date) FROM kdata) - INTERVAL '{lookback} days'
+          AND b.名称 NOT LIKE '%ST%'
+          AND b.上市日期 <= (SELECT MAX(date) FROM kdata) - INTERVAL '60 days'
+    ),
+    recent_dates AS (
+        -- 最近 N 个交易日 (DENSE_RANK, 跳过周末)
+        SELECT DISTINCT date FROM recent_per_symbol
+        ORDER BY date DESC LIMIT {days}
+    ),
+    target_days AS (
+        SELECT r.* FROM recent_per_symbol r
+        JOIN recent_dates d ON r.date = d.date
+    ),
+    hist_pairs AS (
+        -- 一次 join: target 的每条记录配 window_days 条历史 amount
+        SELECT t.symbol AS t_sym, t.date AS t_date,
+               t.amount AS t_amount, t.close, t.name, t.industry,
+               h.amount AS h_amount
+        FROM target_days t
+        JOIN recent_per_symbol h ON h.symbol = t.symbol
+        WHERE h.rn_global BETWEEN (t.rn_global + 1) AND (t.rn_global + {window_days})
+    ),
+    heat_calc AS (
+        -- 一次 GROUP BY 算 heat_pct, 避开相关子查询 (days=30 时性能提升 100x)
+        SELECT t_sym AS symbol, t_date AS date, t_amount AS amount,
+               close, name, industry,
+               SUM(CASE WHEN h_amount <= t_amount THEN 1 ELSE 0 END) * 100.0
+               / NULLIF(COUNT(*), 0) AS heat_pct
+        FROM hist_pairs
+        GROUP BY t_sym, t_date, t_amount, close, name, industry
+    )
+    SELECT symbol, date, heat_pct, amount AS amt, close, name, industry
+    FROM heat_calc ORDER BY date DESC, symbol
+    """
+    df = con.execute(sql).df()
+    # 算每只票每天的 signal: 需要与前一日对比
+    df = df.sort_values(['symbol', 'date']).reset_index(drop=True)
+    df['heat_prev'] = df.groupby('symbol')['heat_pct'].shift(1)
+    df['ret_pct'] = df.groupby('symbol')['close'].pct_change() * 100
+    df['signal'] = 'normal'
+    df.loc[(df['heat_prev'] < cold_th) & (df['heat_pct'] >= hot_th), 'signal'] = 'heating'
+    df.loc[(df['heat_prev'] >= hot_th) & (df['heat_pct'] < cold_th), 'signal'] = 'cooling'
+    df.loc[(df['heat_prev'] >= hot_th) & (df['heat_pct'] >= hot_th), 'signal'] = 'staying'
+    df = df.dropna(subset=['heat_prev'])  # 丢掉每个 symbol 第一条 (无前日对比)
+    df = df.sort_values(['date', 'heat_pct'], ascending=[False, False]).reset_index(drop=True)
+    return df
+
+@st.cache_data(ttl=300)
+def append_heat_rotation_today(window_days: int = 20, hot_th: float = 80.0, cold_th: float = 50.0):
+    """
+    把今天的轮动数据追加到 ~/stock_data/heat_rotation_daily.parquet
+    幂等: 写入前 dedup by (date, symbol, window, hot, cold)
+    注: 取 days=2 拿前一天作为 heat_prev 对照基准
+    """
+    con = get_con()
+    today_str = str(con.execute("SELECT MAX(date) FROM kdata").fetchone()[0])
+
+    df_today = compute_heat_history(days=2, window_days=window_days,
+                                     hot_th=hot_th, cold_th=cold_th)
+    if df_today.empty:
+        return 0, today_str
+    # 只保留今天 (最后一天) 的记录
+    from datetime import datetime as _dt
+    max_date = pd.Timestamp(df_today['date'].max())
+    df_today = df_today[df_today['date'] == max_date].copy()
+    if df_today.empty:
+        return 0, today_str
+    df_today['window_days'] = window_days
+    df_today['hot_th'] = hot_th
+    df_today['cold_th'] = cold_th
+
+    # 读取已有 parquet
+    if os.path.exists(HEAT_PATH):
+        existing = pd.read_parquet(HEAT_PATH)
+        # dedup keys
+        keys = ['date', 'symbol', 'window_days', 'hot_th', 'cold_th']
+        existing_keys = existing[keys].apply(tuple, axis=1)
+        new_keys = df_today[keys].apply(tuple, axis=1)
+        dup_mask = new_keys.isin(existing_keys)
+        new_rows = int((~dup_mask).sum())
+        if new_rows == 0:
+            return 0, today_str
+        df_to_write = pd.concat([existing, df_today[~dup_mask]], ignore_index=True)
+    else:
+        df_to_write = df_today
+        new_rows = len(df_today)
+
+    df_to_write.to_parquet(HEAT_PATH, index=False)
+    return new_rows, today_str
+
+@st.cache_data(ttl=300)
+def load_heat_rotation_backtest(min_window_days: int = 20, hot_th: float = 80.0, cold_th: float = 50.0):
+    """
+    回测: 历史上所有被标记为 heating 的票, 次日 (T+1) 的 ret_pct 表现
+    """
+    if not os.path.exists(HEAT_PATH):
+        return pd.DataFrame()
+    df = pd.read_parquet(HEAT_PATH)
+    # 只看同参数的历史数据 (避免不同阈值混淆)
+    df = df[(df['window_days'] == min_window_days) &
+            (df['hot_th'] == hot_th) &
+            (df['cold_th'] == cold_th)].copy()
+    if df.empty:
+        return df
+    # 次日 ret_pct: 同一只票同一天, 后一天的 ret_pct
+    df = df.sort_values(['symbol', 'date']).reset_index(drop=True)
+    df['next_ret'] = df.groupby('symbol')['ret_pct'].shift(-1)
+    return df
+
 # ---------- 侧栏 ----------
 with st.sidebar:
     st.title("📈 A股数据面板")
@@ -558,7 +775,7 @@ with st.sidebar:
 
     # 页面切换: st.radio 直接返回用户选择, 不绕 session_state
     PAGES = ["🏠 总览", "📊 个股K线", "🏆 ASI 排名", "📈 RPS 排名", "🎯 低吸观察池", "🏭 行业强度", "⚖️ 同业对比",
-             "🔍 筛选检索", "🏆 排行榜", "🏭 行业概览", "💻 SQL 控制台"]
+             "🔥 热度轮动", "🔍 筛选检索", "🏆 排行榜", "🏭 行业概览", "💻 SQL 控制台"]
 
     # 跳转按钮: 通过 st.query_params['page'] 改 page, 这里读出后用
     # (跳转按钮在 ASI 排名/RPS 排名页里, 调 st.query_params.update + st.rerun)
@@ -1840,6 +2057,367 @@ elif page == "🏭 行业概览":
     fig.add_hline(y=0, line_dash="dash", line_color="gray")
     fig.update_layout(height=600, xaxis_title="行业平均 ROE (%)", yaxis_title="涨幅 (%)")
     st.plotly_chart(fig, width='stretch')
+
+
+# ============================================================
+# 页面: 🔥 热度轮动 (2026-06-25 新增)
+# 观察昨天/今天成交额百分位排名的迁移, 找升温/降温/留存三类信号
+# ============================================================
+elif page == "🔥 热度轮动":
+    st.header("🔥 热度轮动")
+    st.caption("""
+热度分 = 当日成交额在过去 N 个交易日窗口内的百分位排名 (0-100, 越高=成交额越异常放量)。
+样本 = 全 A, 过滤 ST 与上市不足 60 天。
+
+三栏对比:
+- **升温榜** (heat_yest < 冷阈值, heat_today >= 热阈值): 昨天默默无闻，今天突然爆发
+- **降温榜** (heat_yest >= 热阈值, heat_today < 冷阈值): 昨天还热门，今天资金撤离
+- **留存榜** (两日都 >= 热阈值): 持续热门, 资金持续涌入
+""")
+
+    # 阈值控件
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        window_days = st.slider("对照窗口 (天)", 5, 60, 20, help="看今天的成交额在过去 N 天里的相对位置")
+    with c2:
+        hot_th = st.slider("热阈值", 50, 95, 80, help="热度 >= 此值认为热门")
+    with c3:
+        cold_th = st.slider("冷阈值", 0, 50, 50, help="热度 < 此值认为冷门")
+
+    if hot_th <= cold_th:
+        st.error("热阈值必须大于冷阈值")
+        st.stop()
+
+    heating, cooling, staying, industry_summary, today_str = compute_heat_rotation(window_days, hot_th, cold_th)
+
+    st.divider()
+    st.caption(f"📅 对照日: 今天 **{today_str}** vs 昨天 | 升温 {len(heating)} | 降温 {len(cooling)} | 留存 {len(staying)}")
+
+    def _fmt(df_in, heat_col_today='heat_today', heat_col_yest='heat_yest'):
+        out = df_in[['symbol', 'name', 'industry', heat_col_yest, heat_col_today,
+                     'amt_today', 'ret_pct', 'close_today']].copy()
+        out.columns = ['代码', '名称', '行业', '昨天热度', '今天热度',
+                       '今日额(亿)', '今日涨跌%', '今日收盘']
+        out['今日额(亿)'] = (out['今日额(亿)'] / 1e8).round(2)
+        out['今日涨跌%'] = out['今日涨跌%'].round(2)
+        out['今日收盘'] = out['今日收盘'].round(2)
+        out['昨天热度'] = out['昨天热度'].round(1)
+        out['今天热度'] = out['今天热度'].round(1)
+        return out
+
+    tab_h, tab_c, tab_s, tab_ind, tab_hist, tab_bt = st.tabs([
+        f"🔥 升温榜 ({len(heating)})",
+        f"❄️ 降温榜 ({len(cooling)})",
+        f"♨️ 留存榜 ({len(staying)})",
+        f"🏭 行业净流入 ({len(industry_summary)})",
+        "📈 多日趋势",
+        "🧪 回测验证",
+    ])
+
+    def _show_with_jump(df_in, key_prefix, label):
+        """升温/降温/留存 tab 通用渲染: dataframe + 跳转 K 线"""
+        st.subheader(label)
+        if df_in.empty:
+            st.info("无符合条件的票")
+            return
+        st.dataframe(_fmt(df_in), width='stretch', height=500)
+        # 预计算 name dict 避免 O(N) 遍历
+        name_map = dict(zip(df_in['symbol'], df_in['name']))
+        target = st.selectbox("跳转 K 线", df_in['symbol'].tolist(),
+                               format_func=lambda s, m=name_map: f"{s} {m.get(s, '')}",
+                               key=f'heat_jump_{key_prefix}')
+        if st.button("📊 查看该股 K 线", key=f'heat_btn_{key_prefix}'):
+            st.query_params.update(page="📊 个股K线", symbol=target)
+            st.rerun()
+
+    with tab_h:
+        _show_with_jump(heating, 'h', "🔥 升温榜: 昨天冷门 → 今天热门")
+    with tab_c:
+        _show_with_jump(cooling, 'c', "❄️ 降温榜: 昨天热门 → 今天冷门")
+    with tab_s:
+        _show_with_jump(staying, 's', "♨️ 留存榜: 两天都热门")
+
+    with tab_ind:
+        st.subheader("🏭 行业净流入榜")
+        st.caption("资金加权版: net_amt = SUM(升温股今日成交额) - SUM(降温股今日成交额) | 票数加权版: net_flow = 升温股数 - 降温股数")
+
+        # 排序模式选择 (用 index 而非字符串包含匹配, 改 radio 选项时不用同时改 if)
+        sort_mode_idx = st.radio(
+            "排序口径",
+            ["💰 资金加权 (net_amt)", "🧮 票数加权 (net_flow)"],
+            key='heat_ind_sort', horizontal=True,
+        )
+        sort_by_amt = sort_mode_idx.startswith("💰")
+        sort_col_display = "净流入额(亿)" if sort_by_amt else "净流入(票数)"
+        # 过滤行业票数太少的 (样本噪声)
+        min_n = st.slider("最少样本数 (行业内股票总数)", 3, 30, 8, key='heat_min_n')
+        ind_view = industry_summary[industry_summary['total_stocks'] >= min_n].copy()
+
+        # 加 (亿) 单位换算
+        ind_view['net_amt_yi'] = (ind_view['net_amt'] / 1e8).round(2)
+        ind_view['heating_amt_yi'] = (ind_view['heating_amt'] / 1e8).round(2)
+        ind_view['cooling_amt_yi'] = (ind_view['cooling_amt'] / 1e8).round(2)
+        ind_view['heat_ratio_pct'] = (ind_view['heat_ratio'] * 100).round(1)
+
+        # 按用户选择重排
+        if sort_by_amt:
+            ind_view = ind_view.sort_values('net_amt', ascending=False).reset_index(drop=True)
+        else:
+            ind_view = ind_view.sort_values('net_flow', ascending=False).reset_index(drop=True)
+
+        ind_show = ind_view[['industry', 'total_stocks', 'heating_n', 'cooling_n',
+                              'staying_n', 'net_flow', 'net_amt_yi',
+                              'heating_amt_yi', 'cooling_amt_yi', 'heat_ratio_pct']]
+        ind_show.columns = ['行业', '总股票数', '升温股数', '降温股数', '留存股数',
+                            '净流入(票数)', sort_col_display,
+                            '升温总额(亿)', '降温总额(亿)', '升温比例%']
+        st.dataframe(ind_show, width='stretch', height=600)
+
+        # 横条图
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"**📈 资金最流入 (Top 10, 按{sort_col_display})**")
+            chart_col = 'net_amt_yi' if sort_by_amt else 'net_flow'
+            top10 = ind_view.nlargest(10, chart_col)
+            st.bar_chart(top10.set_index('industry')[chart_col], height=300, horizontal=True)
+        with c2:
+            st.markdown(f"**📉 资金最流出 (Bottom 10, 按{sort_col_display})**")
+            bot10 = ind_view.nsmallest(10, chart_col)
+            st.bar_chart(bot10.set_index('industry')[chart_col], height=300, horizontal=True)
+
+        st.divider()
+        st.markdown("**🎯 行业资金流向散点图**")
+        st.caption("X=净流入额(亿) | Y=留存股数(持续热门) | 气泡大小=行业总股票数 | 颜色=升温比例(越红越热)")
+
+        import plotly.express as px
+        scatter = ind_view[ind_view['total_stocks'] >= 5].copy()
+        scatter['升温比例'] = scatter['heat_ratio_pct']
+        scatter['净流入(亿)'] = scatter['net_amt_yi']
+
+        if len(scatter) > 0:
+            fig = px.scatter(
+                scatter,
+                x='净流入(亿)', y='staying_n',
+                size='total_stocks', color='升温比例',
+                hover_name='industry',
+                hover_data={'net_amt_yi': ':.1f', 'heating_n': True, 'cooling_n': True,
+                            'total_stocks': True, '升温比例': ':.1f'},
+                color_continuous_scale='RdYlGn',
+                labels={'staying_n': '留存股数', '升温比例': '升温比例(%)'},
+                height=500,
+            )
+            fig.update_layout(showlegend=False)
+            fig.add_hline(y=0, line_dash='dash', line_color='gray', opacity=0.3)
+            fig.add_vline(x=0, line_dash='dash', line_color='gray', opacity=0.3)
+            st.plotly_chart(fig, width='stretch')
+            st.caption(f"📊 共 {len(scatter)} 个行业 (总股票数 >= 5)")
+        else:
+            st.info("样本不足, 调整滑块'最少样本数'查看")
+
+        # 跳转某行业内股票到同业对比
+        if not ind_view.empty:
+            target_ind = st.selectbox("跳转同业对比", ind_view['industry'].tolist(), key='heat_ind_jump')
+            if st.button("📊 查看该行业同业对比", key='heat_btn_ind'):
+                st.session_state['peer_industry_preset'] = target_ind
+                st.session_state._current_page = "⚖️ 同业对比"
+                st.rerun()
+
+    with tab_hist:
+        st.subheader("📈 多日热度趋势")
+        st.caption("""
+横向看多日的热度迁移, 找"连续升温/降温/留存"的股票模式。
+- 拖动滑块改窗口天数 (5/10/20/30)
+- 每日分别给每只票打 1 个 signal, 显示按日期 × 信号的分布
+- 数据仅基于当前内存中的 kdata (不依赖持久化)
+""")
+        hist_days = st.slider("查看最近 N 个交易日", 3, 15, 5, key='heat_hist_days')
+
+        hist_df = compute_heat_history(days=hist_days, window_days=window_days,
+                                       hot_th=hot_th, cold_th=cold_th)
+        if hist_df.empty:
+            st.warning("数据不足")
+            st.stop()
+
+        st.divider()
+        # 按日期 × 信号 计数
+        pivot_cnt = hist_df.groupby(['date', 'signal']).size().unstack(fill_value=0)
+        # 保证列顺序
+        for sig in ['heating', 'cooling', 'staying', 'normal']:
+            if sig not in pivot_cnt.columns:
+                pivot_cnt[sig] = 0
+        pivot_cnt = pivot_cnt[['heating', 'cooling', 'staying', 'normal']]
+        st.markdown("**每日信号分布 (按信号计数)**")
+        st.dataframe(pivot_cnt, width='stretch')
+
+        # 信号占比堆叠条
+        st.markdown("**每日信号占比**")
+        pivot_pct = pivot_cnt.div(pivot_cnt.sum(axis=1), axis=0) * 100
+        st.bar_chart(pivot_pct, height=300)
+
+        st.divider()
+        # 找出连续 heating / cooling 的票
+        st.markdown(f"**连续 ≥ 2 天 heating 的股票 (信号持续=真实趋势)**")
+        hist_sorted = hist_df.sort_values(['symbol', 'date']).reset_index(drop=True)
+        hist_sorted['prev_signal'] = hist_sorted.groupby('symbol')['signal'].shift(1)
+        heat_run = hist_sorted[(hist_sorted['signal'] == 'heating') &
+                                (hist_sorted['prev_signal'] == 'heating')]
+        if heat_run.empty:
+            st.info("无连续 heating 票 (历史窗内还未形成模式)")
+        else:
+            run_summary = heat_run.groupby(['symbol', 'name']).agg(
+                days=('date', 'count'),
+                avg_heat=('heat_pct', 'mean'),
+                first_date=('date', 'min'),
+                last_date=('date', 'max'),
+                industry=('industry', 'first'),
+            ).reset_index().sort_values(['days', 'avg_heat'], ascending=[False, False])
+            st.dataframe(run_summary, width='stretch', height=400)
+
+        st.markdown(f"**连续 ≥ 2 天 cooling 的股票 (信号持续=资金撤离确认)**")
+        cool_run = hist_sorted[(hist_sorted['signal'] == 'cooling') &
+                                (hist_sorted['prev_signal'] == 'cooling')]
+        if cool_run.empty:
+            st.info("无连续 cooling 票")
+        else:
+            run_summary = cool_run.groupby(['symbol', 'name']).agg(
+                days=('date', 'count'),
+                avg_heat=('heat_pct', 'mean'),
+                first_date=('date', 'min'),
+                last_date=('date', 'max'),
+                industry=('industry', 'first'),
+            ).reset_index().sort_values(['days', 'avg_heat'], ascending=[False, True])
+            st.dataframe(run_summary, width='stretch', height=400)
+
+        st.divider()
+        st.markdown("### 🔍 个股信号历史查询")
+        st.caption("输入 6 位股票代码查看该票过去 N 天每天的 heat_pct 与 signal")
+
+        sym_input = st.text_input("股票代码 (6位数字)", "", max_chars=6, key='heat_sym_input')
+        if sym_input:
+            sym_input_clean = sym_input.strip()
+            if not sym_input_clean.isdigit() or len(sym_input_clean) == 0:
+                st.warning("⚠️ 请输入 6 位数字代码 (如 600519)")
+            else:
+                sym_input = sym_input_clean.zfill(6)
+                # 拉长 30 天数据, 不依赖 hist_days
+                sym_hist = compute_heat_history(days=30, window_days=window_days,
+                                                 hot_th=hot_th, cold_th=cold_th)
+                sym_data = sym_hist[sym_hist['symbol'] == sym_input].sort_values('date').reset_index(drop=True)
+                if sym_data.empty:
+                    st.warning(f"代码 {sym_input} 在最近 30 个交易日无数据 (可能停牌/ST/上市不足)")
+                else:
+                    name = sym_data['name'].iloc[0]
+                    industry = sym_data['industry'].iloc[0]
+                    st.markdown(f"**{sym_input} {name}** ({industry}) — 过去 {len(sym_data)} 个交易日")
+
+                # 信号统计
+                sig_stats = sym_data['signal'].value_counts().to_dict()
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("🔥 heating", sig_stats.get('heating', 0))
+                c2.metric("❄️ cooling", sig_stats.get('cooling', 0))
+                c3.metric("♨️ staying", sig_stats.get('staying', 0))
+                c4.metric("⚪ normal", sig_stats.get('normal', 0))
+
+                # 双图: heat_pct 时序 + ret_pct 时序
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**热度时序 (heat_pct)**")
+                    chart_data = sym_data.set_index('date')[['heat_pct', 'heat_prev']]
+                    chart_data.columns = ['今日热度', '昨日热度']
+                    st.line_chart(chart_data, height=300)
+                with c2:
+                    st.markdown("**日收益时序 (ret_pct %)**")
+                    st.bar_chart(sym_data.set_index('date')['ret_pct'], height=300)
+
+                # 数据明细表
+                st.markdown("**每日明细**")
+                detail = sym_data[['date', 'heat_prev', 'heat_pct', 'signal', 'ret_pct', 'amt']].copy()
+                detail.columns = ['日期', '昨日热度', '今日热度', '信号', '涨跌%', '成交额']
+                detail['成交额'] = (detail['成交额'] / 1e8).round(2)
+                detail['涨跌%'] = detail['涨跌%'].round(2)
+                detail['昨日热度'] = detail['昨日热度'].round(1)
+                detail['今日热度'] = detail['今日热度'].round(1)
+                st.dataframe(detail, width='stretch', height=300)
+
+                # 信号变化高亮
+                sig_changes = sym_data[sym_data['signal'].shift(1) != sym_data['signal']].dropna()
+                if not sig_changes.empty:
+                    st.markdown("**信号切换点 (signal 发生变化)**")
+                    change_view = sig_changes[['date', 'heat_prev', 'heat_pct', 'signal', 'ret_pct']].copy()
+                    change_view['heat_change'] = (change_view['heat_pct'] - change_view['heat_prev']).round(1)
+                    change_view.columns = ['日期', '昨日热度', '今日热度', '新信号', '当日涨跌%', '热度变化']
+                    change_view['当日涨跌%'] = change_view['当日涨跌%'].round(2)
+                    st.dataframe(change_view, width='stretch')
+
+                # 跳转到 K 线
+                if st.button("📊 查看该股完整 K 线", key='heat_sym_btn'):
+                    st.query_params.update(page="📊 个股K线", symbol=sym_input)
+                    st.rerun()
+
+    with tab_bt:
+        st.subheader("🧪 回测验证: 历史信号表现")
+        st.caption("""
+每天访问本页时会自动同步今天的轮动数据到 ~/stock_data/heat_rotation_daily.parquet (幂等)。
+回测: 历史被标记为 heating/cooling/staying 的票, 次日 (T+1) 平均涨跌幅。
+- 数据需累积几天才有意义, 第一次访问后第 2 天才会有 next_ret
+- 不同阈值会分别保存 (window_days + hot_th + cold_th 是 dedup key)
+""")
+
+        # 同步按钮 (显式, 给用户控制权)
+        col_sync, col_status = st.columns([1, 3])
+        with col_sync:
+            if st.button("🔄 同步今天数据", key='heat_sync_btn'):
+                st.cache_data.clear()
+                new_n, sync_today = append_heat_rotation_today(window_days, hot_th, cold_th)
+                if new_n == 0:
+                    st.info(f"今日 {sync_today} 已存在 ({sync_today})")
+                else:
+                    st.success(f"✅ 新增 {new_n} 条 ({sync_today})")
+                st.rerun()
+        with col_status:
+            if os.path.exists(HEAT_PATH):
+                st.caption(f"📁 {HEAT_PATH} ({os.path.getsize(HEAT_PATH)//1024} KB)")
+            else:
+                st.caption("📁 尚未生成")
+
+        bt_df = load_heat_rotation_backtest(window_days, hot_th, cold_th)
+        if bt_df.empty:
+            st.warning("无回测数据, 请先点上方 '🔄 同步今天数据', 第二天再来看")
+        else:
+            st.divider()
+            st.markdown(f"**回测样本: {len(bt_df)} 条历史信号记录, "
+                        f"覆盖 {bt_df['date'].nunique()} 个交易日**")
+            valid = bt_df.dropna(subset=['next_ret'])
+            if valid.empty:
+                st.info("需要至少累积 2 天数据才能算 next_ret (今日信号的次日表现需等明天才能验证)")
+            else:
+                st.markdown("**次日表现 (T+1 ret_pct) 按信号分组**")
+                stats = valid.groupby('signal').agg(
+                    n=('next_ret', 'count'),
+                    mean_ret=('next_ret', 'mean'),
+                    median_ret=('next_ret', 'median'),
+                    win_rate=('next_ret', lambda s: (s > 0).mean() * 100),
+                    std=('next_ret', 'std'),
+                ).reset_index()
+                stats['mean_ret'] = stats['mean_ret'].round(2)
+                stats['median_ret'] = stats['median_ret'].round(2)
+                stats['win_rate'] = stats['win_rate'].round(1)
+                stats['std'] = stats['std'].round(2)
+                stats.columns = ['信号', '样本数', '平均涨幅%', '中位涨幅%', '胜率%', '波动%']
+                st.dataframe(stats, width='stretch')
+
+                # 详细分布 - 看 heating 的次日 ret 分布
+                st.markdown("**heating 信号次日涨幅分布**")
+                heating_next = valid[valid['signal'] == 'heating']['next_ret']
+                if len(heating_next) > 0:
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("样本数", len(heating_next))
+                    c2.metric("平均", f"{heating_next.mean():.2f}%")
+                    c3.metric("胜率", f"{(heating_next > 0).mean() * 100:.1f}%")
+                    c4.metric("最大", f"{heating_next.max():.2f}%")
+                    st.bar_chart(heating_next, height=200)
+                else:
+                    st.info("尚无 heating 信号样本")
 
 
 # ============================================================
