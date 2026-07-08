@@ -209,28 +209,75 @@ def page_help(page_name):
 # - 性能与原 DuckDB 一样, 因为底层还是 DuckDB
 # - writer 改 Parquet 时, dashboard 仍能读旧 fd 看到旧数据, 不报错
 
-@st.cache_resource
+# ── mtime 监控 (2026-07-08 新增) ──
+# writer 用 os.replace 原子替换 parquet, DuckDB 内存表不会自动重新读文件
+# 用 st.cache_resource 时, 物化表是启动时一次性快照, 后续 writer 跑了也看不到
+# 解决: 每次 get_con() 时检查关键 parquet 的 mtime, 变了就清 cache 重建
+# 性能: mtime 是 stat() 调用, 微秒级; 物化只在文件变化时重跑
+_KDATA_FILES = [
+    os.environ.get('STOCK_KDATA_WINDOW', f'~/stock_data/kdata_{int(os.environ.get("STOCK_WINDOW_YEARS", "5"))}y.parquet'),
+    os.environ.get('STOCK_KDATA', '~/stock_data/kdata.parquet'),
+    os.environ.get('STOCK_ASI', '~/stock_data/asi_yearly.parquet'),
+    os.environ.get('STOCK_ASI_UP', '~/stock_data/asi_yearly_up.parquet'),
+    os.environ.get('STOCK_BASIC', '~/stock_data/stock_basic.parquet'),
+    os.environ.get('STOCK_HEAT', '~/stock_data/heat_rotation_daily.parquet'),
+]
+_KDATA_FILES = [os.path.expanduser(p) for p in _KDATA_FILES]
+
+
+def _files_signature():
+    """返回所有关键 parquet 的 (mtime, size) 元组, 用于检测文件变化"""
+    sig = []
+    for p in _KDATA_FILES:
+        try:
+            st_ = os.stat(p)
+            sig.append((p, st_.st_mtime, st_.st_size))
+        except OSError:
+            sig.append((p, 0, 0))
+    return tuple(sig)
+
+
 def get_con():
     """打开 in-memory DuckDB, 注册 4 个 Parquet 文件
 
     2026-06-19 v2 优化 (响应速度):
-    - @st.cache_resource: 跨页面/跨用户共享同一个 DuckDB 连接, 避免每次重连
-      重建 5.8s 物化表。Streamlit 1.x + duckdb 1.5+ 线程安全。
     - kdata VIEW → TABLE 物化 (16M 行 一次性 O(N) 扫描, 之后查询 50-100x 加速)
-    - SET threads=8 (并行扫描)
+    - SET threads=2 (本地 2 核, 8 线程会争抢)
     - SET enable_object_cache=true (parquet metadata 跨查询缓存)
     - stock_basic 物化出 slim 表 (代码/名称/行业/地区/上市日期) — 各排名页 JOIN 必备
 
     2026-06-23 窗口优化:
     - 优先读 kdata_{N}y.parquet (裁掉 1990s 历史), 内存峰值从 ~3.7GB 降到 ~1.3GB (5y)
     - 不存在时降级到 KDATA_PATH + WHERE date >= MAX(date) - INTERVAL (零额外磁盘)
-    - threads=2 (本地 2 核, 8 线程会线程争抢)
+
+    2026-07-08 mtime 自动刷新 (修复 cache_resource 卡死 bug):
+    - writer 用 os.replace 原子替换 parquet, 内存表不会自动重读
+    - 启动时物化的表永远看不到 6/26 之后的所有 daily_update
+    - 每次调用检查关键 parquet 的 (mtime, size) 签名, 变化时清掉 st.cache_resource
+    - 签名存 session_state, Streamlit 每次重连/rerun 都会重新走 get_con()
 
     线程安全说明:
     - DuckDB 1.5+ 默认每个 connection 独立 state, 单线程内安全
     - Streamlit 偶发同 session 多线程 (eg 按钮 click 与 auto-refresh 重叠)
       会触发 "Different thread" 错误, 所以加 RLock 保护
     """
+    # mtime 检测: 文件变了就清掉 cache, 强制重建
+    current_sig = _files_signature()
+    cached_sig = st.session_state.get('_con_files_sig')
+    if cached_sig is not None and cached_sig != current_sig:
+        # 文件变化 — 清掉 _get_con_cached 的 cache, 下次调用会重建
+        try:
+            _get_con_cached.clear()
+        except Exception:
+            pass
+    st.session_state['_con_files_sig'] = current_sig
+
+    return _get_con_cached()
+
+
+@st.cache_resource
+def _get_con_cached():
+    """实际建连接的函数 — 走 cache_resource, 文件没变就复用"""
     con = duckdb.connect(':memory:')
     # 性能调优 (本地 2 核机器: threads=2 足够, 8 会争抢)
     con.execute("SET threads TO 2")
