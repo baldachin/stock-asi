@@ -202,6 +202,55 @@ def page_help(page_name):
     with st.expander("📖 功能说明", expanded=False):
         st.markdown(text)
 
+
+def jump_to(target_page, symbol=None, return_to=None, peer_industry_preset=None, use_query_params=True):
+    """统一的页面跳转 helper (2026-07-10 v6 重构).
+
+    工作原理 (v6 修复手动切页"两次点击"问题):
+      1. 设 _preserve_residuals=True → 顶部导航见到标记, 不清刚刚设的残留
+      2. 总是走 query_params 路径 (use_query_params 参数保留兼容, 但忽略, 全部走 qp):
+         - 跳转按钮: qp.page = target, streamlit 内部触发 rerun, 顶部代码读 qp 优先于 ss
+         - peer_industry_preset 字符串也走 qp.industry, 顶部镜像到 ss
+      3. 同时镜像写 ss._current_page / ss.symbol / ss.return_to / ss.peer_industry_preset,
+         让目标页从 ss 读 (因为 qp 顶部会立即 del)
+      4. rerun
+
+    路径一致性保证: 跳转按钮和手动 radio 走同一套"顶部导航顶部"逻辑,
+    唯一区别是 qp 命中 vs qp 未命中. 手动 radio 不会因为动态 key 丢选择 (v6 用固定 key).
+
+    返回值参数语义:
+      symbol / return_to / peer_industry_preset = None → 不动该 key
+      = 具体值 → 写入
+      = False → 显式删除 (清残留)
+    """
+    st.session_state['_preserve_residuals'] = True
+    # v6: 统一走 query_params, 不再走 ss._current_page 直接改路径 (那是 v1 bug 来源)
+    st.query_params['page'] = target_page
+    # peer_industry_preset 字符串也走 qp (顶部会镜像到 ss)
+    if peer_industry_preset is not None:
+        st.query_params['industry'] = peer_industry_preset
+    elif peer_industry_preset is False:
+        if 'industry' in st.query_params:
+            del st.query_params['industry']
+    # 同步写 ss._current_page (顶部读 qp 后会立即 del, ss 是真值, 后续手动切页检测 prev_page 用)
+    st.session_state._current_page = target_page
+    if symbol is not None:
+        st.session_state.symbol = symbol
+    elif symbol is False:
+        if 'symbol' in st.session_state:
+            del st.session_state['symbol']
+    if return_to is not None:
+        st.session_state.return_to = return_to
+    elif return_to is False:
+        if 'return_to' in st.session_state:
+            del st.session_state['return_to']
+    if peer_industry_preset is not None:
+        st.session_state.peer_industry_preset = peer_industry_preset
+    elif peer_industry_preset is False:
+        if 'peer_industry_preset' in st.session_state:
+            del st.session_state['peer_industry_preset']
+    st.rerun()
+
 # ---------- 数据加载 ----------
 # 2026-06-05: 改用 DuckDB in-memory 引擎直接读 Parquet 文件
 # - 无 .db 文件 → 完全没有 DuckDB 锁问题
@@ -984,55 +1033,101 @@ with st.sidebar:
     PAGES = ["🏠 总览", "📊 个股K线", "🏆 ASI 排名", "📈 RPS 排名", "🎯 低吸观察池", "🏭 行业强度", "⚖️ 同业对比",
              "🔥 热度轮动", "🔍 筛选检索", "🏆 排行榜", "🏭 行业概览", "💻 SQL 控制台"]
 
-    # 跳转按钮: 通过 st.query_params['page'] 改 page, 这里读出后用
-    # (跳转按钮在 ASI 排名/RPS 排名页里, 调 st.query_params.update + st.rerun)
+    # 2026-07-10 fix: dashboard.py 顶部导航
+    # - 跳转按钮: 设 _current_page + (return_to/symbol 可选 session_state)
+    # - 手动点 radio: 直接改 widget value, streamlit rerun, 顶部 page_now 从 widget state 读
+    # - query_params 残留: 顶部统一清理, 避免历史栈污染
+    # - session_state 跨页残留: 手动切页时清 ss.symbol / ss.return_to / ss.peer_industry_preset
+    #   (跳转按钮先设 _preserve_residuals=True, 顶部见到标记不清, 用完即清)
     qp = st.query_params
     qp_page = qp.get('page', None)
-    if qp_page in PAGES:
-        st.session_state._current_page = qp_page
-        # 用完即清, 避免 radio 重渲染时仍被 query_params 抢占
+    # 跳转按钮刚触发: qp.page 命中, 临时用 rebuild key 让 widget state 重建 (一次性)
+    # 手动切页或默认状态: 用固定 key, 保留 widget state
+    rebuild_widget = qp_page in PAGES
+    if rebuild_widget:
+        # 跳转按钮刚触发的 query_params 路径 (jump_to 总是写 qp, 不再走 ss 直接改路径)
+        page_now = qp_page
         del st.query_params['page']
-    if '_current_page' not in st.session_state or st.session_state._current_page not in PAGES:
-        st.session_state._current_page = PAGES[0]
+        # 跳转按钮已经设了 _preserve_residuals=True, 顶部不清刚写的 symbol/return_to/peer_industry_preset
+        # 用完即清标记
+        if '_preserve_residuals' in st.session_state:
+            del st.session_state['_preserve_residuals']
+        # 跳转按钮来源的 peer_industry_preset 也可能从 qp 来, 镜像到 ss (目标页读 ss)
+        qp_industry = qp.get('industry', None)
+        if qp_industry is not None:
+            st.session_state['peer_industry_preset'] = qp_industry
+            del st.query_params['industry']
+    else:
+        page_now = st.session_state.get('_current_page', PAGES[0])
+        # 手动切页或默认状态: 不动残留 (残留由下面的 widget-vs-ss 检测清)
+
+    if page_now not in PAGES:
+        page_now = PAGES[0]
+
+    # 清理 URL 残留 (浏览器返回会跳到带 return_to/industry 的 URL, 必须删)
+    for _qpk in ('return_to', 'industry'):
+        if _qpk in qp:
+            del st.query_params[_qpk]
 
     page = st.radio(
         "📑 功能页面",
         PAGES,
-        index=PAGES.index(st.session_state._current_page),
-        key='nav_radio',  # 关键: 给 radio 自己的 widget state, 不需要手动同步
+        index=PAGES.index(page_now),
+        key=f"nav_rebuild_{page_now}" if rebuild_widget else 'nav_radio',
         label_visibility="collapsed",
     )
+    # 手动切页检测: widget value (page) 跟 ss._current_page 不同
+    # 跳转按钮路径: jump_to 设 qp.page + ss._current_page (同步), 这里 prev_page == page, 不进清理
+    # 手动 radio 路径: widget state 变 → ss._current_page 还是上一轮值 → prev_page != page → 清残留
+    prev_page = st.session_state.get('_current_page', None)
+    if prev_page is not None and page != prev_page:
+        for _k in ('symbol', 'return_to', 'peer_industry_preset'):
+            if _k in st.session_state:
+                del st.session_state[_k]
     st.session_state._current_page = page
 
     st.divider()
-    # mtime 自动清缓存 (数据更新后下次访问自动重查)
-    # 注意: 必须包含 dashboard 实际读的 WINDOW_PATH 和 HEAT_PATH,
-    # 否则 writer 重建 window 或 sync_heat 写盘不会触发 cache_resource 失效
-    DATA_SOURCES = [
-        Path(KDATA_PATH),
-        Path(WINDOW_PATH) if os.path.exists(WINDOW_PATH) else None,
-        Path(ASI_PATH), Path(ASI_UP_PATH), Path(BASIC_PATH),
-        Path(HEAT_PATH) if os.path.exists(HEAT_PATH) else None,
-    ]
-    DATA_SOURCES = [p for p in DATA_SOURCES if p is not None]
-    def _latest_mtime() -> float:
-        ms = []
-        for p in DATA_SOURCES:
-            if p.exists():
-                ms.append(p.stat().st_mtime)
-        return max(ms) if ms else 0.0
+    # mtime 自动清缓存 (2026-07-13 fix: 同步清 cache_resource, 不再只清 cache_data)
+    # 历史问题 (2026-07-13): sidebar 这层只 st.cache_data.clear(), 不重建 con (cache_resource).
+    # 写入磁盘 parquet 触发 mtime 变化时, sidebar 这层清 cache_data 只是让 load_* 缓存失效,
+    # 但 get_con() 持有的 con 里物化的 kdata 表仍是旧版. 用户报"仍要重启才更新".
+    # 修复: 跟 get_con() 内层共享 _files_signature(), 检测到变化时同时清 cache_resource.
+    # 这样无论用户在哪个页面/任何 widget 触发 rerun, sidebar 都跑一次完整检测.
+    current_sig = _files_signature()
+    cached_sig = st.session_state.get('_data_files_sig_sidebar')
+    sig_changed = cached_sig is not None and cached_sig != current_sig
+    if sig_changed:
+        # 文件变化: 同时清 cache_data + cache_resource (后者是关键, 重建 con)
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        try:
+            _get_con_cached.clear()
+        except Exception:
+            pass
+        st.session_state._data_files_sig_sidebar = current_sig
+    elif cached_sig is None:
+        st.session_state._data_files_sig_sidebar = current_sig
+
+    # 取最新 mtime 用于 toast/caption 显示 (跟 _files_signature 取同一个值)
     def _fmt_mtime(ts: float) -> str:
         return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts > 0 else "—"
-    current_mtime = _latest_mtime()
-    if "_data_mtime_seen" not in st.session_state:
-        st.session_state._data_mtime_seen = current_mtime
-    if current_mtime > st.session_state._data_mtime_seen:
-        st.cache_data.clear()
-        st.session_state._data_mtime_seen = current_mtime
-        st.toast(f"🔄 数据已更新 ({_fmt_mtime(current_mtime)})", icon="📈")
-    st.caption(f"🕒 数据快照: {_fmt_mtime(current_mtime)}")
+    newest_mtime = max((s[1] for s in current_sig if s[2] > 0), default=0.0)
+    if sig_changed:
+        st.toast(f"🔄 数据已更新 ({_fmt_mtime(newest_mtime)})", icon="📈")
+    st.caption(f"🕒 数据快照: {_fmt_mtime(newest_mtime)}")
     if st.button("🔄 刷新缓存"):
-        st.cache_data.clear()
+        # 全清: cache_data + cache_resource (后者重建 con, 真正重读 parquet)
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        try:
+            _get_con_cached.clear()
+        except Exception:
+            pass
+        st.cache_resource.clear()
         st.rerun()
 
 # ---------- 主页 ----------
@@ -1132,7 +1227,9 @@ elif page == "📊 个股K线":
     st.header("📊 个股K线分析")
     page_help("📊 个股K线")
 
-    # 返回按钮 (从同业对比/行业强度跳来的, 才能返回)
+    # 2026-07-09 fix v5: K 线页需要 return_to 显示返回按钮
+    # 因为顶部统一清理了 query_params['return_to'], K 线页要从 session_state 读
+    # 跳转按钮改用 session_state.return_to (不是 query_params)
     return_to = st.session_state.get('return_to', None)
     if return_to:
         if st.button(f"↩️ 返回 {return_to}", key='kline_back'):
@@ -1140,15 +1237,18 @@ elif page == "📊 个股K线":
             st.session_state.pop('return_to', None)
             st.rerun()
 
-    # 读 session_state.symbol (跳转来的)
-    qp_symbol = st.session_state.get('symbol', None)
+    # 读 session_state.symbol (跳转来的, 5 个 query_params 跳转按钮已经改为设 session_state)
+    # 2026-07-10 fix: str().zfill(6) 防御 int / None / 空字符串, 防止 1167 行 (options['代码'] == qp_symbol) 静默失败
+    raw_symbol = st.session_state.get('symbol', None)
+    qp_symbol = str(raw_symbol).zfill(6) if raw_symbol else None
 
     c1, c2 = st.columns([1, 3])
     with c1:
         # 选股票
         search = st.text_input("🔍 搜索股票 (代码/名称)", qp_symbol or "", key='kline_search')
         if search:
-            mask = basic['代码'].str.contains(search) | basic['名称'].str.contains(search, na=False)
+            # 2026-07-10 fix: regex=False 防用户输入 '%' '|' '(' 等 regex 字符导致静默搜不到
+            mask = basic['代码'].str.contains(search, regex=False) | basic['名称'].str.contains(search, na=False, regex=False)
             options = basic[mask].head(50)
         else:
             options = basic.head(20)
@@ -1459,13 +1559,11 @@ elif page == "🏆 ASI 排名":
     with c2:
         st.write("")  # 间距
         if st.button("📊 查看个股详情", width='stretch'):
-            st.query_params.update(page="📊 个股K线", symbol=sel)
-            st.rerun()
+            jump_to('📊 个股K线', symbol=sel, return_to=st.session_state._current_page)
     with c3:
         st.write("")
         if st.button("🏭 查看个股所属行业强度", width='stretch'):
-            st.query_params.update(page="🏭 行业强度")
-            st.rerun()
+            jump_to('🏭 行业强度', return_to=st.session_state._current_page)
 
     # 可视化
     c1, c2 = st.columns(2)
@@ -1560,8 +1658,7 @@ elif page == "📈 RPS 排名":
     with c2:
         st.write("")
         if st.button("📊 查看该股 K线 + ASI + RPS", key='rps_jump_btn', width='stretch'):
-            st.query_params.update(page="📊 个股K线", symbol=rps_jump)
-            st.rerun()
+            jump_to('📊 个股K线', symbol=rps_jump, return_to=st.session_state._current_page)
 
     # 多周期 RPS 分布散点图 (5 vs 60)
     if len(periods) >= 2 and 5 in periods and 60 in periods:
@@ -1630,6 +1727,14 @@ elif page == "📈 RPS 排名":
 elif page == "🏭 行业强度":
     st.header("🏭 行业强度")
     page_help("🏭 行业强度")
+
+    # 2026-07-09 fix v5: 行业强度页需要 return_to 显示返回按钮
+    return_to = st.session_state.get('return_to', None)
+    if return_to:
+        if st.button(f"↩️ 返回 {return_to}", key='ind_back'):
+            st.session_state._current_page = return_to
+            st.session_state.pop('return_to', None)
+            st.rerun()
 
     # 数据最新日（避免空数据）
     con_local = get_con()
@@ -1738,18 +1843,13 @@ elif page == "🏭 行业强度":
         st.write("")
         if st.button("⚖️ 查看该行业个股", key='ind_jump_btn', width='stretch'):
             # 通过 session_state 传行业, 同业对比页读这个
-            st.session_state['peer_industry_preset'] = ind_jump
-            st.session_state._current_page = "⚖️ 同业对比"
-            st.rerun()
+            jump_to("⚖️ 同业对比", peer_industry_preset=ind_jump, use_query_params=False)
     with c3:
         st.write("")
         # 选该行业第一只股, 直接跳到个股
         first_sym = basic[basic['细分行业'] == ind_jump]['代码'].iloc[0] if len(basic[basic['细分行业'] == ind_jump]) else None
         if first_sym and st.button("📊 看代表股 K线", key='ind_jump_rep', width='stretch'):
-            st.session_state._current_page = "📊 个股K线"
-            st.session_state.symbol = first_sym
-            st.session_state.return_to = "🏭 行业强度"
-            st.rerun()
+            jump_to("📊 个股K线", symbol=first_sym, return_to="🏭 行业强度")
 
 # ============================================================
 # 页面 5: 低吸观察池 (长期强势 + 高关注 + 阶段性低位)
@@ -1940,8 +2040,7 @@ elif page == "🎯 低吸观察池":
             )
         with c2:
             if st.button(f"📊 查看 {target} K线", key=f'btn_jump_{k}'):
-                st.query_params.update(page='📊 个股K线', symbol=target)
-                st.rerun()
+                jump_to('📊 个股K线', symbol=target, return_to=st.session_state._current_page)
         st.divider()
 
 # ============================================================
@@ -2029,16 +2128,14 @@ elif page == "⚖️ 同业对比":
     with c2:
         st.write("")
         if st.button("📊 K线 + ASI", key='peer_jump_btn', width='stretch'):
-            st.session_state._current_page = "📊 个股K线"
-            st.session_state.symbol = jump_sym
-            st.session_state.return_to = "⚖️ 同业对比"
-            st.session_state.pop('peer_industry_preset', None)
-            st.rerun()
+            # 跳到 K 线, 清除 peer_industry_preset (进 K 线不需要它了)
+            jump_to("📊 个股K线", symbol=jump_sym, return_to="⚖️ 同业对比",
+                    peer_industry_preset=False, use_query_params=False)
     with c3:
         st.write("")
         if st.button("↩️ 跳到行业强度", key='peer_back_ind', width='stretch'):
-            st.session_state._current_page = "🏭 行业强度"
-            st.rerun()
+            # 2026-07-10 fix: 用 _current_page (用户从哪来) 而不是写死 "⚖️ 同业对比", 避免 ⚖️↔🏭 循环
+            jump_to("🏭 行业强度", return_to=st.session_state._current_page, use_query_params=False)
 
 # ============================================================
 # 页面 8: 筛选检索 (2026-06-19 整合自老 app.py)
@@ -2351,8 +2448,7 @@ elif page == "🔥 热度轮动":
                                format_func=lambda s, m=name_map: f"{s} {m.get(s, '')}",
                                key=f'heat_jump_{key_prefix}')
         if st.button("📊 查看该股 K 线", key=f'heat_btn_{key_prefix}'):
-            st.query_params.update(page="📊 个股K线", symbol=target)
-            st.rerun()
+            jump_to('📊 个股K线', symbol=target, return_to=st.session_state._current_page)
 
     with tab_h:
         _show_with_jump(heating, 'h', "🔥 升温榜: 昨天冷门 → 今天热门")
@@ -2444,9 +2540,7 @@ elif page == "🔥 热度轮动":
         if not ind_view.empty:
             target_ind = st.selectbox("跳转同业对比", ind_view['industry'].tolist(), key='heat_ind_jump')
             if st.button("📊 查看该行业同业对比", key='heat_btn_ind'):
-                st.session_state['peer_industry_preset'] = target_ind
-                st.session_state._current_page = "⚖️ 同业对比"
-                st.rerun()
+                jump_to("⚖️ 同业对比", peer_industry_preset=target_ind, use_query_params=False)
 
     with tab_hist:
         st.subheader("📈 多日热度趋势")
@@ -2577,8 +2671,7 @@ elif page == "🔥 热度轮动":
 
                 # 跳转到 K 线
                 if st.button("📊 查看该股完整 K 线", key='heat_sym_btn'):
-                    st.query_params.update(page="📊 个股K线", symbol=sym_input)
-                    st.rerun()
+                    jump_to('📊 个股K线', symbol=sym_input, return_to=st.session_state._current_page)
 
     with tab_bt:
         st.subheader("🧪 回测验证: 历史信号表现")
