@@ -78,6 +78,7 @@ A股数据分析和ASI（成交额强度指标）计算系统。数据从腾讯�
 ## 已知数据问题
 
 - 2026-05-06~20 共 11 个交易日历史曾整段缺失 (writer CROP_DAYS=30 裁剪后未被新数据覆盖)，已于 2026-06-08 从旧 stock.db 后悔窗口回填 — 见 `backfill_may_2026.py`。回填逻辑：从旧 db 导出 5/6-5/20，过滤停牌股 (open IS NULL) 246 行 (与 parquet 5/21+ 风格一致) → merge 写入 kdata.parquet (56,760 行, amount 字段全有) → 原子替换。备份：`~/stock_data/kdata.parquet.pre_may_backfill`。
+- **2026-07-13 fix: writer CROP_DAYS=30 → 0** (commit 不存, 源码已改)。原因: `CROP_DAYS=30` + `fetch_all_incremental` 抓取范围不匹配, 每次 cron 累积 "黑洞窗口" 丢数据 (skill: stock-parquet-backfill 提到的根因)。新策略: 不裁切, 追加后按 (symbol, date) dedup keep=last。回填脚本: `backfill_2026_07_09.py` (单日) + `backfill_2026_06_10_07_10.py` (22 天)。备份: `kdata.parquet.pre_cron_damage` (7/10 17:00 cron 跑回退版本) + `kdata.parquet.pre_jul_backfill` (7/9 17:36 备份)。
 - 腾讯证券 API 不返回成交额字段。所有 amount 数据来自 Baostock (query_history_k_data_plus adjustflag='2') 和历史 TDX 导入。
 - 全表仍有少量遗留 NULL/0：约 11,608 行 `open IS NULL` (1990s-2000s 历史停牌股)、约 268 行 `amount=0/空` (1990-12 到 1995-06 的早期数据)，均不在本次修复范围。
 
@@ -91,8 +92,9 @@ A股数据分析和ASI（成交额强度指标）计算系统。数据从腾讯�
 ~/stock/.venv/bin/python ~/stock/backfill_may_2026.py
 
 # 重新计算年度ASI得分 (两套口径, 写 Parquet)
-~/stock/.venv/bin/python ~/stock/asi_calculator_parquet.py              # 全交易日 (asi_yearly.parquet)
-~/stock/.venv/bin/python ~/stock/asi_calculator_parquet.py 2026 --up    # 仅上涨日 (asi_yearly_up.parquet)
+# 注意: --up 默认 = v1+混合 (不建议), 必须加 --no-weighted 才是 v1 纯上涨日
+~/stock/.venv/bin/python ~/stock/asi_calculator_parquet.py                     # v2 全交易日价格加权 (asi_yearly.parquet)
+~/stock/.venv/bin/python ~/stock/asi_calculator_parquet.py --up --no-weighted  # v1 仅上涨日 (asi_yearly_up.parquet)
 
 # 启动Streamlit面板 (dashboard 用 DuckDB in-memory 读 4 个 Parquet)
 ~/stock/.venv/bin/streamlit run ~/stock/dashboard.py --server.port 8501

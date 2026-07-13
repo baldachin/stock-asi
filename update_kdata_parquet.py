@@ -49,7 +49,11 @@ PARQUET_PATH = os.path.expanduser('~/stock_data/kdata.parquet')
 BATCH_SIZE  = 50           # 每批股票数
 MAX_RETRIES = 3
 DAYS_BACK   = 30           # 每次多抓几天防止遗漏 (必须 >= CROP_DAYS, 否则会丢数据)
-CROP_DAYS   = 30           # 合并时裁掉最后 30 天, 避免与已有 recent 数据重复
+# 2026-07-13 fix: CROP_DAYS 从 30 改成 0
+# 原因: CROP_DAYS=30 > 实际 fetch 覆盖范围时, 每次 cron 都丢中间数据 ("黑洞窗口" bug)
+# 新策略: 不裁切, 直接追加 df_new, 写入前按 (symbol, date) dedup keep=last
+# 这样 fetch 失败时, 老数据不会被裁切, 下一轮 cron 能补回
+CROP_DAYS   = 0            # 0 = 不裁切, 保留所有老数据, 由 dedup 处理重复
 # ----------------------------
 
 LOCK_FILE = os.path.expanduser('~/stock_data/update_kdata_parquet.lock')
@@ -287,10 +291,16 @@ def main():
         try:
             with open(LOCK_FILE) as f:
                 pid = f.read().strip()
-            print(f"[{t0.strftime('%H:%M:%S')}] 另一个 update_kdata_parquet 进程 (PID={pid}) 正在运行, 退出")
+            msg = f"[{t0.strftime('%H:%M:%S')}] 另一个 update_kdata_parquet 进程 (PID={pid}) 正在运行, 退出 (exit=2)"
+            print(msg)
+            sys.stderr.write(msg + "\n")
         except Exception:
-            print(f"[{t0.strftime('%H:%M:%S')}] 锁文件存在但无法读取, 退出")
-        return
+            msg = f"[{t0.strftime('%H:%M:%S')}] 锁文件存在但无法读取, 退出 (exit=2)"
+            print(msg)
+            sys.stderr.write(msg + "\n")
+        # 2026-07-09 fix: 撞锁必须返回非零退出码, 让 daily_update.sh / cron 能识别失败
+        # 否则会被误判为成功, 数据没更新也不报警 (历史 bug, 414237 卡死 19h 就是这个原因)
+        sys.exit(2)
 
     try:
         _main_locked(t0)

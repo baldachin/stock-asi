@@ -231,8 +231,26 @@ def calculate_asi(year: int = None, up_only: bool = False, weighted: bool = True
     print(f"  总行数: {len(df_ranked):,}, 年份: {df_ranked['year'].min()} ~ {df_ranked['year'].max()}")
 
 
+def _parse_args():
+    """2026-07-09 fix: 用 argparse 替代手写 argv 解析, --up/--no-weighted 顺序无关
+
+    历史 bug: 旧版 'int(sys.argv[1]) if len(sys.argv) > 1 else None' 写死 argv[1] 当 year,
+    一旦 flag 在前 (e.g. 'python x.py --up --no-weighted') 就 ValueError 崩掉。
+    """
+    import argparse
+    p = argparse.ArgumentParser(
+        description='计算 ASI 年度得分, 写入 Parquet (v2 价格加权 或 v1 仅上涨日)',
+    )
+    p.add_argument('year', nargs='?', type=int, default=None,
+                   help='增量更新指定年份 (默认 None=全量重算 1990-今年)')
+    p.add_argument('--up', action='store_true',
+                   help='仅上涨日口径 (默认是全交易日 + 价格加权)')
+    p.add_argument('--no-weighted', dest='weighted', action='store_false',
+                   help='关闭价格加权 (与 --up 配合 = v1 仅上涨日; 与全交易日配合 = v1 全量)')
+    p.set_defaults(weighted=True)
+    return p.parse_args()
+
+
 if __name__ == '__main__':
-    year = int(sys.argv[1]) if len(sys.argv) > 1 else None
-    up_only = '--up' in sys.argv
-    weighted = '--no-weighted' not in sys.argv
-    calculate_asi(year, up_only=up_only, weighted=weighted)
+    args = _parse_args()
+    calculate_asi(year=args.year, up_only=args.up, weighted=args.weighted)
