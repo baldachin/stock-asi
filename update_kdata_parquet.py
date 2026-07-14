@@ -206,18 +206,36 @@ def merge_and_write(df_new):
     last_date = get_last_date_from_parquet()
     crop_date = last_date - timedelta(days=CROP_DAYS)
 
-    # 2026-06-23: 数据安全校验 — 如果 crop_date 比 df_new 最小日期还大,
-    # 说明 df_new 没完全覆盖裁切窗口, 裁切会永久丢失中间数据 → abort
+    # 2026-07-14 fix v2: 修 df_new 跳日的丢数据 bug
+    # 案例: backfill 7/13 (df_new=[7/13]) 时 last_date=7/10
+    # 旧 mask=pc.less(date, crop_date=last_date=7/10) 保留 < 7/10, df_new 没 7/10 → 7/10 永久丢
+    # v2 核心: crop_date = df_new.min_date, 保留 < df_new.min_date (含 last_date 当天), df_new 补 [df_new.min_date, df_new.max]
+    # v2 边界:
+    #   - df_new.min_date == last_date: crop_date=last_date, 保留 < last_date, df_new 补 last_date ✓
+    #   - df_new.min_date < last_date (含 7/10 老数据): crop_date=df_new.min_date, 保留 < df_new.min_date, df_new 补回 [df_new.min_date, ..] ✓
+    #   - df_new.min_date > last_date (跳日): crop_date=df_new.min_date, 保留 < df_new.min_date (含 last_date), df_new 补 [df_new.min_date, ..] ✓ (关键修复)
     if not df_new.empty:
         df_new_min_date = df_new['date'].min()
         if isinstance(df_new_min_date, str):
             df_new_min_date = pd.to_datetime(df_new_min_date).date()
-        if crop_date > df_new_min_date:
-            msg = (f'[FATAL] crop_date={crop_date} > df_new.min_date={df_new_min_date}, '
-                   f'裁切窗口未被新数据完全覆盖, 拒绝写入以防数据丢失. '
-                   f'增加 DAYS_BACK 或手动修复.')
-            print(msg, flush=True)
-            raise RuntimeError(msg)
+        df_new_max_date = df_new['date'].max()
+        if isinstance(df_new_max_date, str):
+            df_new_max_date = pd.to_datetime(df_new_max_date).date()
+        if df_new_max_date < last_date:
+            # df_new 没新数据 (盘中/上游抽风/节假日), 跳过本轮
+            print(f'[WARN] df_new.max_date={df_new_max_date} < parquet.last_date={last_date}, '
+                  f'上游无新数据 (可能盘中/节假日/baostock抽风). 跳过本轮写盘, 保留 parquet 原状.', flush=True)
+            return
+        # crop_date = df_new.min_date, 保留 [.., df_new.min_date-1], df_new 补 [df_new.min_date, df_new.max]
+        if crop_date != df_new_min_date:
+            print(f'[INFO] crop_date 调整: {crop_date} → {df_new_min_date} '
+                  f'(df_new 范围 {df_new_min_date}~{df_new_max_date}, 保留 [.., {df_new_min_date}], '
+                  f'避免跳日丢数据).', flush=True)
+            crop_date = df_new_min_date
+        if df_new_max_date > last_date:
+            print(f'[INFO] df_new 覆盖到 {df_new_max_date} (parquet 最后 {last_date}), 写入后会推进.', flush=True)
+        else:
+            print(f'[INFO] df_new 终点 == {last_date}, 重写/去重场景 (新数据可能等于老数据).', flush=True)
     print(f"\n[Step4] 流式重写 kdata.parquet (裁掉 {crop_date} 之后)...")
 
     # 流式: 用 ParquetWriter 逐 row group 写
