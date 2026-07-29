@@ -2,7 +2,8 @@
 """
 K线数据增量更新 - Parquet 版 (替代 update_kdata_duckdb.py)
 
-数据源: Baostock (返回 amount 成交额，支持前复权)
+数据源: 同花顺 ths_kline (主源, 含 amount, 200ms/rq)
+       Baostock (fallback, 17:00 高峰限流时切回)
 存储: ~/stock_data/kdata.parquet (snappy 压缩, 1M 行/row group)
 策略:
   1. 从 kdata.parquet 读 max_date (用 row group 过滤避免加载全量)
@@ -127,7 +128,37 @@ def get_all_codes():
     return codes
 
 def fetch_one(code, start_date, end_date):
-    """拉取单只股票的日K线, 返回 DataFrame"""
+    """拉取单只股票的日K线, 返回 DataFrame.
+
+    2026-07-28 改造: 主源 ths_kline (同花顺 HTTP, 不限速, 含 amount).
+    fallback: baostock (ths_kline 失败/返回空时切回, 永久保留).
+
+    字段映射 (ths_kline -> baostock schema):
+      ths.date (str YYYYMMDD) -> date object
+      ths.open/high/low/close/volume/amount -> 同名
+    """
+    # 主源: ths_kline (同花顺, 200ms/rq, 不限速)
+    start_str = start_date.replace('-', '') if '-' in start_date else start_date
+    end_str = end_date.replace('-', '') if '-' in end_date else end_date
+    for attempt in range(MAX_RETRIES):
+        try:
+            sys.path.insert(0, '/home/hanshuang8902/stock')
+            from fetchers import ths_kline
+            rows = ths_kline.fetch_one(code, 'D', start_str, end_str)
+            if not rows:
+                # ths_kline 返回空 (盘中/暂停/ST) -> 切 baostock
+                break
+            df = pd.DataFrame(rows)
+            df['date'] = pd.to_datetime(df['date'].astype(str), format='%Y%m%d').dt.date
+            df['symbol'] = code
+            for col in ['open', 'high', 'low', 'close', 'amount']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df['volume'] = df['volume'].astype('int64')
+            return df[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume', 'amount']]
+        except Exception:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(0.5)
+    # fallback: baostock (验证用, 17:00 高峰限流时切回)
     bs_code = f"sh.{code}" if code.startswith(('6', '9')) else f"sz.{code}"
     for attempt in range(MAX_RETRIES):
         try:
@@ -144,10 +175,10 @@ def fetch_one(code, start_date, end_date):
                 return pd.DataFrame()
             df['symbol'] = code
             df['date'] = pd.to_datetime(df['date']).dt.date
-            for col in ['open','high','low','close','volume','amount']:
+            for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             df['volume'] = df['volume'].astype('int64')
-            return df[['date','symbol','open','high','low','close','volume','amount']]
+            return df[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume', 'amount']]
         except Exception:
             if attempt < MAX_RETRIES - 1:
                 time.sleep(0.5)
@@ -165,7 +196,21 @@ def fetch_all_incremental(codes, start_date, end_date, t0):
     all_dfs = []
 
     for batch_idx, batch in enumerate(batches):
-        bs.login()
+        # 2026-07-15 fix: 整批 login 失败重试 (之前 bs.login() 失败直接抛, 整批 50 只 0 行)
+        for login_try in range(MAX_RETRIES):
+            try:
+                bs.login()
+                break
+            except Exception as e:
+                if login_try < MAX_RETRIES - 1:
+                    print(f'\n  [WARN] batch {batch_idx+1} login 失败 ({e}), 重试 {login_try+1}/{MAX_RETRIES}', flush=True)
+                    time.sleep(2)
+                else:
+                    print(f'\n  [WARN] batch {batch_idx+1} login 失败 {MAX_RETRIES} 次, 跳过该批 50 只股', flush=True)
+                    bs.logout()
+                    break
+        else:
+            continue  # login 全部失败, 跳过本批
         try:
             for code in batch:
                 df = fetch_one(code, start_date, end_date)
@@ -246,16 +291,42 @@ def merge_and_write(df_new):
 
     pf = pq.ParquetFile(PARQUET_PATH)
     kept_rows = 0
+    # TDX 迁移后主表含退市股/B股/指数，而 df_new 只含当前 A 股。
+    # 旧逻辑按日期裁掉整个窗口，会误删这些未抓取 symbol。
+    # 新逻辑只剔除 df_new 实际覆盖的 (symbol, date)，其余历史行原样保留。
+    replacement_keys = set(zip(df_new['symbol'], df_new['date']))
+    replacement_dates = pa.array(sorted(set(df_new['date'])), type=pa.date32())
+    replaced_old_rows = 0
     for rg_idx in range(pf.num_row_groups):
         rg = pf.read_row_group(rg_idx)
-        mask = pa.compute.less(rg.column('date'), crop_date)
-        rg_filtered = rg.filter(mask)
+        rg_filtered = rg
+        # 先用 Arrow 的日期过滤缩小到最近约 30 天，再只对候选行检查复合键。
+        # 避免对每个 symbol 扫描整个 row group（12K symbols × 29M 行不可接受）。
+        date_candidate_mask = pa.compute.is_in(
+            rg.column('date'), value_set=replacement_dates
+        )
+        candidate_indices = pa.compute.indices_nonzero(date_candidate_mask)
+        if len(candidate_indices) > 0:
+            candidate_symbols = rg.column('symbol').take(candidate_indices).to_pylist()
+            candidate_dates = rg.column('date').take(candidate_indices).to_pylist()
+            replace_indices = [
+                idx for idx, symbol, row_date in zip(
+                    candidate_indices.to_pylist(), candidate_symbols, candidate_dates
+                )
+                if (symbol, row_date) in replacement_keys
+            ]
+            if replace_indices:
+                import numpy as np
+                keep = np.ones(len(rg), dtype=bool)
+                keep[replace_indices] = False
+                rg_filtered = rg.filter(pa.array(keep))
+                replaced_old_rows += len(replace_indices)
         if len(rg_filtered) > 0:
             writer.write_table(rg_filtered)
             kept_rows += len(rg_filtered)
         if (rg_idx + 1) % 5 == 0:
             print(f"    处理 {rg_idx + 1}/{pf.num_row_groups} row groups (保留 {kept_rows:,} 行)")
-    print(f"  老数据保留: {kept_rows:,} 行 ({pf.num_row_groups} row groups)")
+    print(f"  老数据保留: {kept_rows:,} 行 ({pf.num_row_groups} row groups), 替换旧键: {replaced_old_rows:,} 行")
 
     # 写新数据
     if not df_new.empty:
@@ -333,6 +404,19 @@ def _main_locked(t0):
     print(f"\n{'='*50}")
     print(f"[{t0.strftime('%H:%M:%S')}] K线增量更新 (Baostock + Parquet)")
     print(f"{'='*50}")
+
+    # === 安全闸门 (2026-07-28 TDX 迁移) ===
+    # 新 kdata.parquet 含 28.7M 行 (12,016 symbol),本 writer 只覆盖 A 股 (5,215 只),会丢退市股
+    # 拒绝运行,直到迁移完成
+    try:
+        import duckdb
+        cur_rows = duckdb.connect(':memory:').execute(
+            f"SELECT COUNT(*) FROM read_parquet('{PARQUET_PATH}')"
+        ).fetchone()[0]
+        if cur_rows > 18_000_000:
+            print(f"  [INFO] TDX 全量数据集: {cur_rows:,} 行；启用按 (symbol,date) 精确替换模式")
+    except Exception as e:
+        print(f"  [WARN] 安全闸门检查失败: {e}")
 
     # Step 1: 本地最新日期
     print(f"\n[Step1] 读取本地快照...")

@@ -349,6 +349,28 @@ def _get_con_cached():
             WHERE date >= (SELECT MAX(date) FROM read_parquet('{KDATA_PATH}')) - INTERVAL '{WINDOW_YEARS} years'
         """)
 
+    # 2026-07-28: adj_factor JOIN 提供前复权视图 kdata_qfq
+    # adj_factor_daily 只含 5,294 只有除权事件的 symbol; 没事件的 symbol 用 COALESCE = 1.0
+    ADJ_FACTOR_PATH = '/home/hanshuang8902/stock_data/adj_factor_daily.parquet'
+    if os.path.exists(ADJ_FACTOR_PATH):
+        con.execute(f"""
+            CREATE OR REPLACE VIEW kdata_qfq AS
+            SELECT
+                k.symbol, k.date,
+                k.open   * COALESCE(adj.adj_factor, 1.0) AS open,
+                k.high   * COALESCE(adj.adj_factor, 1.0) AS high,
+                k.low    * COALESCE(adj.adj_factor, 1.0) AS low,
+                k.close  * COALESCE(adj.adj_factor, 1.0) AS close,
+                k.volume,
+                k.amount
+            FROM kdata k
+            LEFT JOIN read_parquet('{ADJ_FACTOR_PATH}') adj
+                ON k.symbol = adj.symbol AND k.date = adj.date
+        """)
+    else:
+        # 没因子表时, qfq = raw
+        con.execute("CREATE OR REPLACE VIEW kdata_qfq AS SELECT * FROM kdata")
+
     # asi_yearly 两个口径 — 体积小, VIEW 即可
     for view, path in [('asi_yearly', ASI_PATH), ('asi_yearly_up', ASI_UP_PATH)]:
         if os.path.exists(path):
@@ -439,12 +461,16 @@ def load_stock_basic():
     return pd.read_parquet(BASIC_PATH)
 
 @st.cache_data(ttl=300)
-def load_kdata(symbol, start_date, end_date):
-    """读单只股票K线"""
+def load_kdata(symbol, start_date, end_date, use_qfq=False):
+    """读单只股票K线
+    use_qfq=False (默认): 不复权原始价 (TDX 数据)
+    use_qfq=True: 前复权价 (close_qfq = close_unadj * adj_factor)
+    """
     con = get_con()
-    df = con.execute("""
+    src = 'kdata_qfq' if use_qfq else 'kdata'
+    df = con.execute(f"""
         SELECT date, open, high, low, close, volume, amount
-        FROM kdata
+        FROM {src}
         WHERE symbol = ? AND date BETWEEN ? AND ?
         ORDER BY date
     """, [symbol, start_date, end_date]).df()
@@ -1279,7 +1305,7 @@ elif page == "📊 个股K线":
         st.caption(f"行业: {info['细分行业']} | 地区: {info['地区']} | 上市: {info['上市日期']}")
 
     # ASI 口径
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     with c1:
         start = st.date_input("起始日", date(2025, 1, 1), min_value=date(1990, 1, 1))
     with c2:
@@ -1297,11 +1323,22 @@ elif page == "📊 个股K线":
         asi_mode = st.radio("ASI口径", ["v2 加权", "v1 仅上涨日"], index=0, key='kline_asi_mode',
                             horizontal=True, help="v2 加权推荐, v1 旧版仅上涨日")
         asi_mode_key = "v2" if "v2" in asi_mode else "up"
+    with c7:
+        use_qfq = st.checkbox("前复权", False, key='kline_use_qfq',
+                              help="开启后 close 等于前复权价 (close_qfq = close_unadj * adj_factor)\n关闭时是 TDX 不复权原始价")
 
     df = load_kdata_with_asi(symbol, start, end, asi_mode_key)
     if df.empty:
         st.warning("该日期范围无数据")
         st.stop()
+
+    # 如果选了前复权, 覆盖 df 的 OHLC (load_kdata_with_asi 算 RPS/ASI 用的是不复权 close)
+    if use_qfq:
+        qfq_df = load_kdata(symbol, start, end, use_qfq=True)
+        if not qfq_df.empty:
+            qfq_df = qfq_df.set_index('date')[['open', 'high', 'low', 'close']]
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = df['date'].map(qfq_df[col])
 
     # 周/月 K 线 resample (2026-06-19 整合自老 app.py)
     if period != "日":

@@ -1,0 +1,36 @@
+*** a/SKILL.md
+--- b/SKILL.md
+@@ Backup data source K-line row, end of 经 2026-07-11 实测存活、零鉴权可用段后 @@
+| K线(全历史) | mootdx/百度/腾讯 | 同花顺 | `d.10jqka.com.cn/v6/line/hs_{code}/01/last.js`（01日/11周/21月/30/60分；2001至今；JSONP剥壳） |
+
+**同花顺 K 线字段顺序（实测 2026-07-28 校准，600519 反推）**：
+
+| 索引 | 字段 | 类型 | 备注 |
+|------|------|------|------|
+| 0 | date | YYYYMMDD | 交易日期 |
+| 1 | open | float | 开盘价 |
+| 2 | high | float | 最高价 |
+| 3 | low | float | 最低价 |
+| 4 | close | float | 收盘价 |
+| 5 | volume | int | 成交量（手） |
+| 6 | amount | float | 成交额（元） |
+| 7 | amplitude_pct | float | 振幅（%） |
+| 8 | change_pct | float | 涨跌幅（%，空 = 退市或新上市） |
+| 9 | change_amt | float | 涨跌额（元） |
+| 10 | turnover_pct | float | 换手率（%） |
+
+**验证**（参见 commit 6248f29 给出的 vendor 脚本）：
+- 600519 20260727 反推: vals[2]=1308.00=high, vals[3]=1279.58=low, vals[4]=1289.50=close
+- baostock `query_history_k_data_plus` 同一交易日: close=1289.50, amount=4129228559.78
+- 字段 0-6 跟 baostock schema 完全一致，可直接替换主源
+
+**JSONP 剥壳示例**：
+```python
+import json, urllib.request
+text = urllib.request.urlopen('https://d.10jqka.com.cn/v6/line/hs_600519/01/last.js', timeout=10).read().decode('utf-8')
+# 原始: quotebridge_v6_line_hs_600519_01_last({...})
+# 剥壳:
+j = json.loads(text[text.index('(') + 1:text.rindex(')')])
+rows = j['data'].split(';')
+# 字段以 ',' 分隔，每行是单日 K 线
+```
